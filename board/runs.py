@@ -8,16 +8,20 @@ scored. This writes one small public file per team on the board, newest run firs
 
 Only fields board.json already publishes for a best or latest run go out: times, commit, track, the
 axes, the stage and failed gate, and the one-line failure message. Log tails never do. Untouched-starter
-runs are skipped. A file is rewritten only when its runs changed, so `aws s3 sync` uploads just those.
-Run by speeddemon-runs.timer every 10 s.
+runs are skipped. A file is rewritten only when its runs changed, and with --upload only those go to S3
+(the publisher key may put objects but not list the bucket, so `aws s3 sync` is out). A failed upload
+stays in .pending and is retried next time. Run by speeddemon-runs.timer every 10 s.
 
     python3 board/runs.py --history /srv/speeddemon/board/state/history.jsonl \
-        --board /srv/speeddemon/board/public/board.json --out /srv/speeddemon/board/public/runs
+        --board /srv/speeddemon/board/public/board.json --out /srv/speeddemon/board/public/runs \
+        --upload s3://raptors.dev/speeddemon.dev/2026/board/runs
 """
 import argparse
+import concurrent.futures as cf
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 
@@ -64,11 +68,37 @@ def write_if_changed(path, runs):
     return True
 
 
+def upload(out, dest, changed):
+    """aws s3 cp every changed or still-pending file; whatever fails stays pending for the next run."""
+    pending_path = os.path.join(out, ".pending")
+    try:
+        with open(pending_path) as f:
+            pending = set(f.read().split())
+    except OSError:
+        pending = set()
+    pending |= set(changed)
+
+    def put(slug):
+        src = os.path.join(out, f"{slug}.json")
+        r = subprocess.run(["aws", "s3", "cp", src, f"{dest}/{slug}.json", "--cache-control", "max-age=5",
+                            "--content-type", "application/json", "--only-show-errors"],
+                           capture_output=True, text=True, timeout=60)
+        return slug, r.returncode == 0 or not os.path.exists(src)
+
+    with cf.ThreadPoolExecutor(8) as ex:
+        left = {s for s, ok in ex.map(put, sorted(pending)) if not ok}
+    with open(pending_path + ".tmp", "w") as f:
+        f.write("\n".join(sorted(left)))
+    os.replace(pending_path + ".tmp", pending_path)
+    return len(pending) - len(left), len(left)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--history", required=True)
     ap.add_argument("--board", required=True, help="the public board.json: only its teams get a file")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--upload", help="s3:// prefix to copy changed files to")
     a = ap.parse_args()
     with open(a.board) as f:
         slugs = {t.get("slug") for t in json.load(f).get("teams") or []}
@@ -81,8 +111,11 @@ def main():
             except ValueError:
                 continue               # a torn last line while the board appends
     os.makedirs(a.out, exist_ok=True)
-    changed = sum(write_if_changed(os.path.join(a.out, f"{s}.json"), runs) for s, runs in collect(rows, slugs).items())
-    print(f"runs: {len(slugs)} teams, {changed} files changed")
+    changed = [s for s, runs in collect(rows, slugs).items() if write_if_changed(os.path.join(a.out, f"{s}.json"), runs)]
+    sent, left = upload(a.out, a.upload.rstrip("/"), changed) if a.upload else (0, 0)
+    print(f"runs: {len(slugs)} teams, {len(changed)} files changed, {sent} uploaded, {left} pending")
+    if left:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
