@@ -377,7 +377,7 @@ fn main() {
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/records.csv"));
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
-    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
+    let threads = 6;
     let count = codes.len();
     let stride = count.next_multiple_of(8);
     let shared = Shared {
