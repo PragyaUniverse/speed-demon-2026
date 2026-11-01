@@ -375,6 +375,7 @@ impl Graph {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        std::process::exit(3); // PROBE
         let mut heavy: Vec<(u64, u32)> = heavy.into_inner().unwrap();
 
         let forward = Csr::build(n, shift, parts);

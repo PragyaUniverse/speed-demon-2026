@@ -677,11 +677,7 @@ fn main() {
                         }
                         let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
                         let (base, docs) = worker.scan(&file, from, to, &shared);
-                        let words = docs.div_ceil(64).max(1);
-                        worker.invert(words);
-                        let mut slot = firsts[i].lock().unwrap();
-                        slot.base = base;
-                        worker.answer_bools(base, words, &shared, &mut slot.entries);
+                        std::hint::black_box((base, docs)); // PROBE
                     }
                 })
             })
@@ -689,6 +685,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    std::process::exit(3); // PROBE
     // Chunks in ascending order give each query its smallest ids first.
     let mut first_ten = vec![[0u32; 10]; q.total];
     let mut filled = vec![0u8; q.total];
