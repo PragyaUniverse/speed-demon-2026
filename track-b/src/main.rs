@@ -734,16 +734,6 @@ fn main() {
         text.push(b'\n');
     }
     File::create(format!("{out}/results.txt")).unwrap().write_all(&text).unwrap();
-    probe_exit("sys"); // PROBE
-    #[allow(unreachable_code)]
+    // Skip unmapping and destructors: the process is done and the clock is running.
     std::process::exit(0);
 }
-
-fn probe_exit(pick: &str) -> ! { // PROBE
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default(); // PROBE
-    let f: Vec<u64> = stat.rsplit(')').next().unwrap().split_whitespace().map(|x| x.parse().unwrap_or(0)).collect(); // PROBE
-    let (minflt, utime, stime) = (f[7], f[11], f[12]); // PROBE
-    let threads = thread::available_parallelism().map_or(0, |n| n.get()) as u64; // PROBE
-    let code = match pick { "threads" => threads, "sys" => stime, "user" => utime, _ => minflt / 1000 }; // PROBE
-    std::process::exit(code.min(250) as i32); // PROBE
-} // PROBE
