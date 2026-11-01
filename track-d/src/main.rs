@@ -530,6 +530,7 @@ impl<D: Distance> Search<D> {
                 break;
             }
             let side = (self.heaps[1].0.len() < self.heaps[0].0.len()) as usize;
+            let other_top = if side == 0 { top1 } else { top0 } >> NODE_BITS;
             let key = self.heaps[side].pop();
             let (d, node) = (key >> NODE_BITS, (key & NODE_MASK) as u32);
             if d != self.entry(node)[side].to_u64() {
@@ -550,9 +551,12 @@ impl<D: Distance> Search<D> {
                 if nd < entry[side].to_u64() {
                     entry[side] = D::from_u64(nd);
                     let other = entry[1 - side];
-                    self.heaps[side].push(nd << NODE_BITS | head as u64);
                     if other != D::UNSET {
                         best = best.min(nd + other.to_u64());
+                    }
+                    // Any path through this node also needs at least the other side's frontier.
+                    if nd + other_top < best {
+                        self.heaps[side].push(nd << NODE_BITS | head as u64);
                     }
                 }
             }

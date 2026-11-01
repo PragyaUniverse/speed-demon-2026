@@ -13,7 +13,7 @@ use std::{env, ptr, slice, thread};
 
 const HOURS: usize = 72;
 const SEGMENTS: usize = 24;
-const READ_BYTES: usize = 1 << 18;
+const READ_BYTES: usize = 1 << 17;
 const PAD: usize = 64;
 const BLOCK: usize = 256; // Words per block; the first word links to the hour's previous block.
 const SLOT_BITS: u32 = 12;
