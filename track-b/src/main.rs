@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
@@ -342,10 +342,6 @@ struct Worker {
     emitted: Vec<u8>,
     hits: Vec<(u32, u32)>,
     last_hit: Vec<u32>,
-    /// Per BOOL query: matches and id sum so far. Thread-local, as all workers walk the queries in
-    /// the same order and shared counters would bounce between cores on every match.
-    tallies: Vec<u32>,
-    sums: Vec<u64>,
 }
 
 /// One chunk's first-ten candidates: query << 16 | relative document, ascending by query.
@@ -357,6 +353,8 @@ struct ChunkFirsts {
 struct Shared<'a> {
     q: &'a Queries,
     plan: &'a Plan,
+    counts: Vec<AtomicU32>,
+    sums: Vec<AtomicU64>,
 }
 
 #[inline(always)]
@@ -379,8 +377,6 @@ impl Worker {
             emitted: vec![0; q.total],
             hits: Vec::new(),
             last_hit: vec![NONE; q.phrases.len()],
-            tallies: vec![0; q.bools.len()],
-            sums: vec![0; q.bools.len()],
         }
     }
 
@@ -537,7 +533,7 @@ impl Worker {
         let q = shared.q;
         self.result.resize(words.max(self.result.len()), 0);
         self.scratch.resize(words.max(self.scratch.len()), 0);
-        for (ordinal, &(query, first, count)) in q.bools.iter().enumerate() {
+        for &(query, first, count) in &q.bools {
             let ops = &q.bool_ops[first as usize..(first + count) as usize];
             if !self.evaluate(ops, words) {
                 continue;
@@ -570,8 +566,8 @@ impl Worker {
             }
             if matches > 0 {
                 self.emitted[query as usize] = 10 - quota as u8;
-                self.tallies[ordinal] += matches as u32;
-                self.sums[ordinal] += sum;
+                shared.counts[query as usize].fetch_add(matches as u32, Relaxed);
+                shared.sums[query as usize].fetch_add(sum, Relaxed);
             }
         }
     }
@@ -666,11 +662,13 @@ fn main() {
     let shared = Shared {
         q: &q,
         plan: &plan,
+        counts: (0..q.total).map(|_| AtomicU32::new(0)).collect(),
+        sums: (0..q.total).map(|_| AtomicU64::new(0)).collect(),
     };
     let firsts: Vec<Mutex<ChunkFirsts>> =
         (0..chunks).map(|_| Mutex::new(ChunkFirsts { base: 0, entries: Vec::new() })).collect();
     let claim = AtomicUsize::new(0);
-    let results: Vec<(Vec<(u32, u32)>, Vec<u32>, Vec<u64>)> = thread::scope(|scope| {
+    let hit_lists: Vec<Vec<(u32, u32)>> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
@@ -678,7 +676,7 @@ fn main() {
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
                         if i >= chunks {
-                            return (worker.hits, worker.tallies, worker.sums);
+                            return std::mem::take(&mut worker.hits);
                         }
                         let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
                         let (base, docs) = worker.scan(&file, from, to, &shared);
@@ -707,17 +705,14 @@ fn main() {
             }
         }
     }
-    let (mut counts, mut sums) = (vec![0u64; q.total], vec![0u64; q.total]);
-    let mut hits: Vec<(u32, u32)> = Vec::new();
-    for (worker_hits, tallies, worker_sums) in results {
-        hits.extend_from_slice(&worker_hits);
-        for (ordinal, &(query, ..)) in q.bools.iter().enumerate() {
-            counts[query as usize] += tallies[ordinal] as u64;
-            sums[query as usize] += worker_sums[ordinal];
-        }
-    }
+    let mut hits: Vec<(u32, u32)> = hit_lists.into_iter().flatten().collect();
     hits.sort_unstable();
     hits.dedup();
+    let (mut counts, mut sums) = (vec![0u64; q.total], vec![0u64; q.total]);
+    for (query, c) in shared.counts.iter().enumerate() {
+        counts[query] = c.load(Relaxed) as u64;
+        sums[query] = shared.sums[query].load(Relaxed);
+    }
     for &(query, doc) in &hits {
         let query = query as usize;
         counts[query] += 1;

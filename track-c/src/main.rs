@@ -147,18 +147,6 @@ unsafe fn text_field(p: *const u8) -> (*const u8, usize, usize, *const u8) {
     (start, raw, raw - escapes, q.add(2))
 }
 
-/// Asks for a cache line ahead of use, so the miss overlaps with other work instead of stalling it.
-#[inline(always)]
-fn prefetch<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::*;
-        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
-}
-
 /// Multiply-mix over all bytes of the name, with a masked load so that nothing past it counts.
 #[inline(always)]
 unsafe fn hash_name(p: *const u8, len: usize) -> u64 {
@@ -238,9 +226,7 @@ impl Shared {
 
 }
 
-const NO_GROUP: u32 = u32::MAX;
 const BATCH: usize = 128;
-const RING: usize = 16;
 
 /// One worker's aggregates, plus its (name id, group) pairs on their way to the lines' owners.
 struct Worker {
@@ -248,26 +234,11 @@ struct Worker {
     groups: Vec<Group>,
     pending: Vec<(usize, [u32; BATCH])>,
     spare: Vec<u32>,
-    /// Names waiting for their prefetched table slot: (hash, group), oldest next. Without this each
-    /// lookup stalls on a table larger than L2; with it the misses overlap with the parsing.
-    ring: [(u64, u32); RING],
-    ring_at: usize,
 }
 
 impl Worker {
     fn new(me: usize, count: usize) -> Self {
-        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new(), ring: [(0, NO_GROUP); RING], ring_at: 0 }
-    }
-
-    #[inline(always)]
-    fn queue_name(&mut self, shared: &Shared, hash: u64, group: usize) {
-        prefetch(unsafe { shared.names.as_ptr().add((hash & ID_MASK) as usize) });
-        let at = self.ring_at & (RING - 1);
-        self.ring_at += 1;
-        let (old_hash, old_group) = std::mem::replace(unsafe { self.ring.get_unchecked_mut(at) }, (hash, group as u32));
-        if old_group != NO_GROUP {
-            self.mark_name(shared, old_group as usize, shared.name_id(old_hash));
-        }
+        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new() }
     }
 
     #[inline(always)]
@@ -296,12 +267,6 @@ impl Worker {
 
     /// Sends what is left, then keeps applying until no worker can send any more.
     fn finish(&mut self, shared: &Shared) {
-        for i in 0..RING {
-            let (hash, group) = self.ring[i];
-            if group != NO_GROUP {
-                self.mark_name(shared, group as usize, shared.name_id(hash));
-            }
-        }
         for (line, (len, batch)) in self.pending.iter().enumerate() {
             shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(&batch[..*len]);
         }
@@ -363,7 +328,7 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker
             g.amount_max = g.amount_max.max(amount);
             g.name_bytes += name_len as u64;
             g.note_bytes += note_len as u64;
-            worker.queue_name(shared, hash_name(name, name_raw), group);
+            worker.mark_name(shared, group, shared.name_id(hash_name(name, name_raw)));
         }
     }
 }

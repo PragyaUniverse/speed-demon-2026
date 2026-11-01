@@ -50,8 +50,7 @@ fn map_file(path: String) -> &'static [u8] {
     }
 }
 
-/// Zeroed u32 array on huge pages where the kernel allows: searches jump around the graph at random,
-/// and at 4 KB per page the TLB misses would cost more than the cache misses.
+/// Zeroed u32 array. The huge page request is overridden by the process-wide opt-out in `main`.
 fn huge_u32s(n: usize) -> &'static mut [u32] {
     const PROT_RW: i32 = 3;
     const MADV_HUGEPAGE: i32 = 14;
@@ -62,18 +61,6 @@ fn huge_u32s(n: usize) -> &'static mut [u32] {
         madvise(base, bytes, MADV_HUGEPAGE);
         slice::from_raw_parts_mut(base as *mut u32, n)
     }
-}
-
-/// Asks for a cache line ahead of use, so the miss overlaps with other work instead of stalling it.
-#[inline(always)]
-fn prefetch<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::*;
-        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = p;
 }
 
 /// Parses the decimal number at `p` (ended by a space or LF); returns it and the byte after the end.
@@ -261,16 +248,12 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
                             order.push(x as u32);
                             let mut at = blob;
                             while at < order.len() {
-                                if let Some(&next) = order.get(at + 1) {
-                                    prefetch(unsafe { old.edges.as_ptr().add(old.offsets[next as usize] as usize) });
-                                }
                                 let edges = old.adjacent(order[at]);
                                 edge_count += edges.len();
                                 for &e in edges {
                                     let v = (e >> WEIGHT_BITS) as usize;
                                     if order.len() - blob < BLOB && claim(v) {
                                         order.push(v as u32);
-                                        prefetch(unsafe { old.offsets.as_ptr().add(v) });
                                     }
                                 }
                                 at += 1;
@@ -310,18 +293,6 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
                 let (off, out) = (off_at as *mut u32, out_at as *mut u32);
                 let mut pos = eb;
                 for (i, &x) in order.iter().enumerate() {
-                    // Three misses per node, each resolved a few nodes ahead of the one before it.
-                    if let Some(&far) = order.get(i + 12) {
-                        prefetch(old.offsets.as_ptr().add(far as usize));
-                    }
-                    if let Some(&mid) = order.get(i + 6) {
-                        prefetch(old.edges.as_ptr().add(old.offsets[mid as usize] as usize));
-                    }
-                    if let Some(&near) = order.get(i + 2) {
-                        for &e in old.adjacent(near) {
-                            prefetch(rank.as_ptr().add((e >> WEIGHT_BITS) as usize));
-                        }
-                    }
                     *off.add(nb + i) = pos as u32;
                     for &e in old.adjacent(x) {
                         let head = *rank.get_unchecked((e >> WEIGHT_BITS) as usize);
