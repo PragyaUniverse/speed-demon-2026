@@ -328,7 +328,7 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker
             g.amount_max = g.amount_max.max(amount);
             g.name_bytes += name_len as u64;
             g.note_bytes += note_len as u64;
-            std::hint::black_box((worker.me, hash_name(name, name_raw))); // PROBE
+            worker.mark_name(shared, group, shared.name_id(hash_name(name, name_raw)));
         }
     }
 }
@@ -428,7 +428,6 @@ fn main() {
         }
     });
 
-    std::process::exit(3); // PROBE
     let rows = (shared.next_name.load(Relaxed) as usize >> 6) + 1;
     let mut lines = BTreeMap::new();
     for (group, t) in totals.iter().enumerate().filter(|(_, t)| t.count > 0) {
