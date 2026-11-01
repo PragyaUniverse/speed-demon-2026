@@ -6,8 +6,8 @@
 //! its rarest term by reading the text around them. Memory is bounded by the chunk, not the corpus.
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
@@ -38,26 +38,9 @@ fn map_file(path: String) -> &'static [u8] {
     let file = File::open(path).unwrap();
     let len = file.metadata().unwrap().len() as usize;
     unsafe {
-        let base = mmap(
-            ptr::null_mut(),
-            len + 128 * 1024,
-            PROT_READ,
-            MAP_PRIVATE | MAP_ANON,
-            -1,
-            0,
-        );
+        let base = mmap(ptr::null_mut(), len + 128 * 1024, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
         if len > 0 {
-            assert_eq!(
-                mmap(
-                    base,
-                    len,
-                    PROT_READ,
-                    MAP_PRIVATE | MAP_FIXED,
-                    file.as_raw_fd(),
-                    0
-                ),
-                base
-            );
+            assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0), base);
         }
         slice::from_raw_parts(base, len)
     }
@@ -75,11 +58,7 @@ const LOWER: u64 = 0x2020202020202020;
 #[inline(always)]
 unsafe fn token_key(p: *const u8, len: usize) -> (u64, u64) {
     let head = (load(p) | LOWER) & (u64::MAX >> (64 - 8 * len.min(8)));
-    let tail = if len > 8 {
-        load(p.add(len - 8)) | LOWER
-    } else {
-        0
-    };
+    let tail = if len > 8 { load(p.add(len - 8)) | LOWER } else { 0 };
     (head, tail)
 }
 
@@ -97,17 +76,10 @@ unsafe fn classify(p: *const u8) -> (u64, u64) {
         let v = _mm256_loadu_si256(q as *const __m256i);
         // Shift each class up to the top of the signed range; one compare then tests both ends.
         let lower = _mm256_or_si256(v, _mm256_set1_epi8(0x20));
-        let letters = _mm256_cmpgt_epi8(
-            _mm256_add_epi8(lower, _mm256_set1_epi8(5)),
-            _mm256_set1_epi8(0x65),
-        );
-        let digits = _mm256_cmpgt_epi8(
-            _mm256_add_epi8(v, _mm256_set1_epi8(0x46)),
-            _mm256_set1_epi8(0x75),
-        );
+        let letters = _mm256_cmpgt_epi8(_mm256_add_epi8(lower, _mm256_set1_epi8(5)), _mm256_set1_epi8(0x65));
+        let digits = _mm256_cmpgt_epi8(_mm256_add_epi8(v, _mm256_set1_epi8(0x46)), _mm256_set1_epi8(0x75));
         let token = _mm256_movemask_epi8(_mm256_or_si256(letters, digits)) as u32 as u64;
-        let lf =
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32 as u64;
+        let lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))) as u32 as u64;
         (token, lf)
     };
     let (a, b) = (half(p), half(p.add(32)));
@@ -253,20 +225,13 @@ struct Queries {
 
 fn parse_queries(text: &'static [u8]) -> Queries {
     let mut q = Queries {
-        terms: Terms {
-            slots: vec![0; 1 << TABLE_BITS],
-            text: Vec::new(),
-        },
+        terms: Terms { slots: vec![0; 1 << TABLE_BITS], text: Vec::new() },
         bool_ops: Vec::new(),
         bools: Vec::new(),
         phrases: Vec::new(),
         total: 0,
     };
-    for (index, line) in text
-        .split(|&b| b == b'\n')
-        .filter(|l| !l.is_empty())
-        .enumerate()
-    {
+    for (index, line) in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
         q.total += 1;
         if line.starts_with(b"BOOL ") {
             let first = q.bool_ops.len() as u32;
@@ -282,16 +247,11 @@ fn parse_queries(text: &'static [u8]) -> Queries {
                     };
                 }
             }
-            q.bools
-                .push((index as u32, first, q.bool_ops.len() as u32 - first));
+            q.bools.push((index as u32, first, q.bool_ops.len() as u32 - first));
         } else {
             let words = line[8..line.len() - 1].split(|&b| b == b' ');
             let terms = words.map(|w| q.terms.intern(w)).collect();
-            q.phrases.push(Phrase {
-                query: index as u32,
-                terms,
-                anchor_at: 0,
-            });
+            q.phrases.push(Phrase { query: index as u32, terms, anchor_at: 0 });
         }
     }
     assert!(q.total <= 1 << 16);
@@ -331,9 +291,6 @@ struct Plan {
     /// Per term: range in `anchored` of the phrases anchored on it.
     anchored_at: Vec<u32>,
     anchored: Vec<u32>,
-    /// Per BOOL term: range in `lifting` of the BOOL queries it can make non-empty (ORed in, or first).
-    lifting_at: Vec<u32>,
-    lifting: Vec<u32>,
 }
 
 fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
@@ -353,9 +310,7 @@ fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
     for phrase in &mut q.phrases {
         // Rarest in the sample; among terms it never saw, the longest word is the best guess.
         let rank = |t: u32| (frequency[t as usize], usize::MAX - text[t as usize].len());
-        phrase.anchor_at = (0..phrase.terms.len())
-            .min_by_key(|&i| rank(phrase.terms[i]))
-            .unwrap();
+        phrase.anchor_at = (0..phrase.terms.len()).min_by_key(|&i| rank(phrase.terms[i])).unwrap();
         let anchor = phrase.terms[phrase.anchor_at] as usize;
         role[anchor] |= ANCHOR_TERM;
         counts[anchor + 1] += 1;
@@ -370,33 +325,7 @@ fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
         anchored[cursor[anchor] as usize] = i as u32;
         cursor[anchor] += 1;
     }
-    let mut lifting_at = vec![0u32; bool_terms as usize + 2];
-    let lifts = |&(op, _): &(Op, u32)| op == Op::Or;
-    q.bool_ops
-        .iter()
-        .filter(|o| lifts(o))
-        .for_each(|o| lifting_at[o.1 as usize + 2] += 1);
-    for t in 2..lifting_at.len() {
-        lifting_at[t] += lifting_at[t - 1];
-    }
-    let mut lifting = vec![0u32; lifting_at[bool_terms as usize + 1] as usize];
-    for (ordinal, &(_, first, count)) in q.bools.iter().enumerate() {
-        for op in q.bool_ops[first as usize..(first + count) as usize]
-            .iter()
-            .filter(|o| lifts(o))
-        {
-            lifting[lifting_at[op.1 as usize + 1] as usize] = ordinal as u32;
-            lifting_at[op.1 as usize + 1] += 1;
-        }
-    }
-    Plan {
-        role,
-        bool_terms: bool_terms as usize,
-        anchored_at: counts,
-        anchored,
-        lifting_at,
-        lifting,
-    }
+    Plan { role, bool_terms: bool_terms as usize, anchored_at: counts, anchored }
 }
 
 /// One worker's reusable buffers.
@@ -413,8 +342,6 @@ struct Worker {
     emitted: Vec<u8>,
     hits: Vec<(u32, u32)>,
     last_hit: Vec<u32>,
-    /// Bit per BOOL query: some term that could make it non-empty occurs in this chunk.
-    active: Vec<u64>,
 }
 
 /// One chunk's first-ten candidates: query << 16 | relative document, ascending by query.
@@ -450,7 +377,6 @@ impl Worker {
             emitted: vec![0; q.total],
             hits: Vec::new(),
             last_hit: vec![NONE; q.phrases.len()],
-            active: vec![0; q.bools.len() / 64 + 1],
         }
     }
 
@@ -470,13 +396,8 @@ impl Worker {
             let wanted = capacity.min(end - position);
             // A LF in front means reading backwards from the first document's text stops in time.
             buffer[PAD - 1] = b'\n';
-            file.read_exact_at(&mut buffer[PAD..PAD + wanted], position as u64)
-                .unwrap();
-            let whole = buffer[PAD..PAD + wanted]
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .unwrap()
-                + 1;
+            file.read_exact_at(&mut buffer[PAD..PAD + wanted], position as u64).unwrap();
+            let whole = buffer[PAD..PAD + wanted].iter().rposition(|&b| b == b'\n').unwrap() + 1;
             unsafe {
                 let mut p = buffer.as_ptr().add(PAD);
                 let stop = p.add(whole);
@@ -492,12 +413,7 @@ impl Worker {
                     docs += 1;
                     let rel = id - base;
                     assert!(rel >> REL_BITS == 0);
-                    let (log, last_doc, last_hit, hits) = (
-                        &mut self.log,
-                        &mut self.last_doc,
-                        &mut self.last_hit,
-                        &mut self.hits,
-                    );
+                    let (log, last_doc, last_hit, hits) = (&mut self.log, &mut self.last_doc, &mut self.last_hit, &mut self.hits);
                     p = for_each_token(p.add(1), |a, b| {
                         let term = q.terms.find(a, b as usize - a as usize);
                         if term == NONE {
@@ -534,8 +450,7 @@ impl Worker {
 
     /// Groups the log by term: each term's documents become a sorted u16 list, or a bitset if it
     /// has enough of them that word-at-a-time operations win.
-    fn invert(&mut self, words: usize, plan: &Plan) {
-        self.active.fill(0);
+    fn invert(&mut self, words: usize) {
         self.counts.fill(0);
         for &entry in &self.log {
             self.counts[(entry >> REL_BITS) as usize + 1] += 1;
@@ -545,13 +460,6 @@ impl Worker {
         for t in 0..self.dense_of.len() {
             let count = self.counts[t + 1];
             self.dense_of[t] = NONE;
-            if count > 0 {
-                for &ordinal in
-                    &plan.lifting[plan.lifting_at[t] as usize..plan.lifting_at[t + 1] as usize]
-                {
-                    self.active[ordinal as usize >> 6] |= 1 << (ordinal & 63);
-                }
-            }
             if count as usize >= words {
                 self.dense_of[t] = (self.dense.len() / words) as u32;
                 self.dense.resize(self.dense.len() + words, 0);
@@ -577,20 +485,14 @@ impl Worker {
         self.result[..words].fill(0);
         let mut any = false;
         for &(op, t) in ops {
-            let (from, to) = (
-                if t == 0 { 0 } else { self.counts[t as usize] },
-                self.counts[t as usize + 1],
-            );
+            let (from, to) = (if t == 0 { 0 } else { self.counts[t as usize] }, self.counts[t as usize + 1]);
             let docs = &self.list[from as usize..to as usize];
             let at = self.dense_of[t as usize];
             match op {
                 Op::Or => {
                     if at != NONE {
                         let bits = &self.dense[at as usize * words..][..words];
-                        self.result[..words]
-                            .iter_mut()
-                            .zip(bits)
-                            .for_each(|(r, b)| *r |= b);
+                        self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r |= b);
                     } else {
                         docs.iter().for_each(|&d| set_bit(&mut self.result, d));
                     }
@@ -599,10 +501,7 @@ impl Worker {
                 Op::And if any => {
                     if at != NONE {
                         let bits = &self.dense[at as usize * words..][..words];
-                        self.result[..words]
-                            .iter_mut()
-                            .zip(bits)
-                            .for_each(|(r, b)| *r &= b);
+                        self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r &= b);
                     } else {
                         self.scratch[..words].fill(0);
                         for &d in docs {
@@ -616,10 +515,7 @@ impl Worker {
                 Op::Not if any && !docs.is_empty() => {
                     if at != NONE {
                         let bits = &self.dense[at as usize * words..][..words];
-                        self.result[..words]
-                            .iter_mut()
-                            .zip(bits)
-                            .for_each(|(r, b)| *r &= !b);
+                        self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r &= !b);
                     } else {
                         for &d in docs {
                             self.result[d as usize >> 6] &= !(1 << (d & 63));
@@ -637,49 +533,41 @@ impl Worker {
         let q = shared.q;
         self.result.resize(words.max(self.result.len()), 0);
         self.scratch.resize(words.max(self.scratch.len()), 0);
-        for at in 0..self.active.len() {
-            let mut pending = self.active[at];
-            while pending != 0 {
-                let ordinal = at * 64 + pending.trailing_zeros() as usize;
-                pending &= pending - 1;
-                let (query, first, count) = q.bools[ordinal];
-                let ops = &q.bool_ops[first as usize..(first + count) as usize];
-                if !self.evaluate(ops, words) {
+        for &(query, first, count) in &q.bools {
+            let ops = &q.bool_ops[first as usize..(first + count) as usize];
+            if !self.evaluate(ops, words) {
+                continue;
+            }
+            let (mut matches, mut sum) = (0u64, 0u64);
+            let mut quota = 10 - self.emitted[query as usize] as u32;
+            for (w, &word) in self.result[..words].iter().enumerate() {
+                if word == 0 {
                     continue;
                 }
-                let (mut matches, mut sum) = (0u64, 0u64);
-                let mut quota = 10 - self.emitted[query as usize] as u32;
-                for (w, &word) in self.result[..words].iter().enumerate() {
-                    if word == 0 {
-                        continue;
-                    }
-                    let n = word.count_ones() as u64;
-                    matches += n;
-                    // The sum of a word's bit positions, one popcount per bit of the position.
-                    const MASKS: [u64; 6] = [
-                        0xAAAAAAAAAAAAAAAA,
-                        0xCCCCCCCCCCCCCCCC,
-                        0xF0F0F0F0F0F0F0F0,
-                        0xFF00FF00FF00FF00,
-                        0xFFFF0000FFFF0000,
-                        0xFFFFFFFF00000000,
-                    ];
-                    let positions: u64 = (0..6)
-                        .map(|k| ((word & MASKS[k]).count_ones() as u64) << k)
-                        .sum();
-                    sum += n * (base as u64 + 64 * w as u64) + positions;
-                    let mut rest = word;
-                    while quota > 0 && rest != 0 {
-                        out.push(query << 16 | (w as u32 * 64 + rest.trailing_zeros()));
-                        rest &= rest - 1;
-                        quota -= 1;
-                    }
+                let n = word.count_ones() as u64;
+                matches += n;
+                // The sum of a word's bit positions, one popcount per bit of the position.
+                const MASKS: [u64; 6] = [
+                    0xAAAAAAAAAAAAAAAA,
+                    0xCCCCCCCCCCCCCCCC,
+                    0xF0F0F0F0F0F0F0F0,
+                    0xFF00FF00FF00FF00,
+                    0xFFFF0000FFFF0000,
+                    0xFFFFFFFF00000000,
+                ];
+                let positions: u64 = (0..6).map(|k| ((word & MASKS[k]).count_ones() as u64) << k).sum();
+                sum += n * (base as u64 + 64 * w as u64) + positions;
+                let mut rest = word;
+                while quota > 0 && rest != 0 {
+                    out.push(query << 16 | (w as u32 * 64 + rest.trailing_zeros()));
+                    rest &= rest - 1;
+                    quota -= 1;
                 }
-                if matches > 0 {
-                    self.emitted[query as usize] = 10 - quota as u8;
-                    shared.counts[query as usize].fetch_add(matches as u32, Relaxed);
-                    shared.sums[query as usize].fetch_add(sum, Relaxed);
-                }
+            }
+            if matches > 0 {
+                self.emitted[query as usize] = 10 - quota as u8;
+                shared.counts[query as usize].fetch_add(matches as u32, Relaxed);
+                shared.sums[query as usize].fetch_add(sum, Relaxed);
             }
         }
     }
@@ -690,8 +578,7 @@ unsafe fn phrase_at(q: &Queries, phrase: &Phrase, at: *const u8) -> bool {
     let text = |t: u32| q.terms.text[t as usize];
     let same = |p: *const u8, len: usize, t: u32| {
         let word = text(t);
-        word.len() == len
-            && (0..len).all(|i| (*p.add(i)) | ((*p.add(i) >= b'A') as u8 * 0x20) == word[i])
+        word.len() == len && (0..len).all(|i| (*p.add(i)) | ((*p.add(i) >= b'A') as u8 * 0x20) == word[i])
     };
     let mut p = at;
     for &t in phrase.terms[..phrase.anchor_at].iter().rev() {
@@ -737,10 +624,7 @@ fn doc_start(input: &[u8], from: usize) -> usize {
     if from == 0 || from >= input.len() {
         return from.min(input.len());
     }
-    from + input[from..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map_or(input.len() - from, |i| i + 1)
+    from + input[from..].iter().position(|&b| b == b'\n').map_or(input.len() - from, |i| i + 1)
 }
 
 fn push_number(out: &mut Vec<u8>, mut v: u64) {
@@ -773,9 +657,7 @@ fn main() {
     let frequency = sample_frequencies(&q, &input[..sample_end]);
     let plan = make_plan(&mut q, &frequency);
 
-    let threads = thread::available_parallelism()
-        .map_or(12, |n| n.get())
-        .min(12);
+    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let chunks = input.len().div_ceil(CHUNK_BYTES);
     let shared = Shared {
         q: &q,
@@ -783,14 +665,8 @@ fn main() {
         counts: (0..q.total).map(|_| AtomicU32::new(0)).collect(),
         sums: (0..q.total).map(|_| AtomicU64::new(0)).collect(),
     };
-    let firsts: Vec<Mutex<ChunkFirsts>> = (0..chunks)
-        .map(|_| {
-            Mutex::new(ChunkFirsts {
-                base: 0,
-                entries: Vec::new(),
-            })
-        })
-        .collect();
+    let firsts: Vec<Mutex<ChunkFirsts>> =
+        (0..chunks).map(|_| Mutex::new(ChunkFirsts { base: 0, entries: Vec::new() })).collect();
     let claim = AtomicUsize::new(0);
     let hit_lists: Vec<Vec<(u32, u32)>> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -802,13 +678,10 @@ fn main() {
                         if i >= chunks {
                             return std::mem::take(&mut worker.hits);
                         }
-                        let (from, to) = (
-                            doc_start(input, i * CHUNK_BYTES),
-                            doc_start(input, (i + 1) * CHUNK_BYTES),
-                        );
+                        let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
                         let (base, docs) = worker.scan(&file, from, to, &shared);
                         let words = docs.div_ceil(64).max(1);
-                        worker.invert(words, &plan);
+                        worker.invert(words);
                         let mut slot = firsts[i].lock().unwrap();
                         slot.base = base;
                         worker.answer_bools(base, words, &shared, &mut slot.entries);
@@ -860,10 +733,7 @@ fn main() {
         }
         text.push(b'\n');
     }
-    File::create(format!("{out}/results.txt"))
-        .unwrap()
-        .write_all(&text)
-        .unwrap();
+    File::create(format!("{out}/results.txt")).unwrap().write_all(&text).unwrap();
     // Skip unmapping and destructors: the process is done and the clock is running.
     std::process::exit(0);
 }

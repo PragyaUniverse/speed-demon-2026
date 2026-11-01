@@ -1,11 +1,27 @@
 # Track B: performance log
 
-"Mac", "VM" and "Harness" mean the same as in Track A's log. The VM has no AVX2, so its tokeniser is a byte-at-a-time fallback and overstates the scan. Reference on the box: 56.35 s, 2,200 MB. Run IDs are filled in as board runs happen, and none has been measured yet.
+"Mac", "VM" and "Harness" mean the same as in Track A's log. The VM has no AVX2, so its tokeniser is a byte-at-a-time fallback and overstates the scan. Reference on the box: 56.35 s, 2,200 MB. The first table is local work before the first board run; the second is every board run.
 
 Before writing any code I measured the seed-1 data: 53,444 distinct BOOL terms with 21M (term, document) pairs, but anchor occurrences for the phrases total only 835K. A global index would need about 84 MB of lists, so the design avoids one.
 
 | Step | Change | Run ID | T local | M (MB) | Result |
 |---|---|---|---|---|---|
-| 1 | Per-chunk engine with anchored phrase verification, 4 MB chunks | pending | 166 ms VM | 68 harness | All hashes correct first time, against the worked example, tiny, sample and full |
-| 2 | 2 MB chunks | pending | 160 ms VM | 48 | Same time, a lot less memory |
-| 3 | 1 MB chunks | pending | 163 ms VM | 41 | Below the 44 MB point where memory stops earning, at no measurable cost in the VM. To be rechecked on the box, where query evaluation is a bigger share of the run |
+| 1 | Per-chunk engine with anchored phrase verification, 4 MB chunks | before first push | 166 ms VM | 68 harness | All hashes correct first time, against the worked example, tiny, sample and full |
+| 2 | 2 MB chunks | before first push | 160 ms VM | 48 | Same time, a lot less memory |
+| 3 | 1 MB chunks | before first push | 163 ms VM | 41 | Below the 44 MB point where memory stops earning, at no measurable cost in the VM. Revisited on the box below |
+
+## Board runs
+
+Each run ID below is one timed run on the scoring box. One run per push, so single numbers are noisy: re-running identical code moved times by up to about 15%, and I compare several runs before believing a change. Failed runs marked PROBE or DIAGNOSTIC were deliberate: they exit non-zero early because the board still reports their time, which is the only way to time one phase on the real CPU. Stderr is not public, so the diagnostic's printed timings were never visible.
+
+| Commit | Change | Run ID | T (ms) | M (MB) | Result |
+|---|---|---|---|---|---|
+| c6c4c16 | First push | run-f345352b47f3 | 356 | 41.8 | K 20.1 |
+| f05f592 | Huge pages off | run-5e5ea27b086f | 330 | 42.6 | No memory effect here, unlike A and C |
+| dd48cce | PROBE: stop after query parse and planning | run-f31783ee7d38 | 21.3 | 12.4 | Setup is about 6% |
+| 65702b2 | `MAP_POPULATE` | run-74dfaeff9fbf | 357 | 41.5 | **Slower, reverted** |
+| d5361fb | Buffered reads; phrases verified during the scan | run-b657a340a7e5 | 345 | 43.5 | Little change in time, kept because it drops the anchor log |
+| 851f573 | PROBE: scan only | run-e5f5b2a30958 | 193 | 30.1 | Scan about 172 ms, BOOL evaluation about 150 ms |
+| 80c0536 | 1 MB term table, 2 MB chunks | run-b23c2e23102c | 319 | 44.1 | Better, and the smaller table pays for the larger chunks' memory |
+| 4b279b1 | PGO on generator output, seed 2 sample | run-9913070bddc2 | 295 | 44.3 | Two more samples: run-474e8ac31656 313, run-4238f68a2125 293. **Kept on this track only** |
+| a9e9fc9 | Evaluate only queries a present term can lift | run-eb4f16d76d8b | 293 | 44.3 | **No gain for 39 lines, reverted** |
