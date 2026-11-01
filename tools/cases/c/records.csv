@@ -1,0 +1,14 @@
+﻿id,name,note,region_id,amount
+1,"Kaphar, Titus","said ""no"" twice",7,1420.00
+2,"Betts","a note that
+spans two lines",7,88.50
+3,,"",12,0.00
+4,"trailing space ","comma, quote "" and newline
+together",3,-5.25
+﻿5,"Betts ","one
+two
+three",12,-0.75
+6,"",,12,10.00
+﻿7,"Ann ""Annie"" Lee","x",5,2.00
+8,"Nobody","",4000000,-1.00
+9,"Neg","n",20,-0.05

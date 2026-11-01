@@ -1,0 +1,18 @@
+BOOL bail AND bond
+BOOL bail
+BOOL estate OR surety AND bail
+BOOL bond NOT bail
+BOOL bail NOT bail
+BOOL zurich
+BOOL rich AND z
+BOOL not AND bond
+BOOL 7
+BOOL the OR writ OR case
+PHRASE "bail bond"
+PHRASE "bail bail bond"
+PHRASE "bond bail"
+PHRASE "habeas corpus"
+PHRASE "u s c 1983"
+PHRASE "estate bond"
+PHRASE "forfeited writ"
+PHRASE "in the matter of"
