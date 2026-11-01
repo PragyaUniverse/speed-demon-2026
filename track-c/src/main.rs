@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const SEGMENTS: usize = 64;
@@ -186,11 +187,16 @@ const EMPTY: Group = Group {
 struct Shared {
     /// region_id -> group index; one extra zero at the end catches every larger region_id.
     region_group: Vec<u8>,
-    groups: usize,
     names: &'static [AtomicU64],
     next_name: AtomicU32,
-    /// Bit matrix: one row of `groups` words per 64 name ids, so ids stay dense in memory.
+    /// Bit matrix: one row of `stride` words per 64 name ids, so ids stay dense in memory. Each
+    /// cache line (the eight groups sharing it) has one owning worker, the only one to touch it:
+    /// the matrix stays in that core's L2 instead of bouncing between cores on every record.
     seen: &'static [AtomicU64],
+    stride: usize,
+    /// Each worker's incoming (name id, group) pairs for the lines it owns.
+    inboxes: Vec<Mutex<Vec<u32>>>,
+    finished: AtomicUsize,
 }
 
 impl Shared {
@@ -216,14 +222,58 @@ impl Shared {
         }
     }
 
+}
+
+const BATCH: usize = 128;
+
+/// One worker's aggregates, plus its (name id, group) pairs on their way to the lines' owners.
+struct Worker {
+    me: usize,
+    groups: Vec<Group>,
+    pending: Vec<(usize, [u32; BATCH])>,
+    spare: Vec<u32>,
+}
+
+impl Worker {
+    fn new(me: usize, count: usize) -> Self {
+        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new() }
+    }
+
     #[inline(always)]
-    fn mark_name(&self, group: usize, id: usize) {
-        let word = unsafe { self.seen.get_unchecked((id >> 6) * self.groups + group) };
-        let bit = 1u64 << (id & 63);
-        // Most repeats avoid the locked instruction and its store-buffer drain.
-        if word.load(Relaxed) & bit == 0 {
-            word.fetch_or(bit, Relaxed);
+    fn mark_name(&mut self, shared: &Shared, group: usize, id: usize) {
+        let line = group >> 3;
+        let (len, batch) = unsafe { self.pending.get_unchecked_mut(line) };
+        unsafe { *batch.get_unchecked_mut(*len) = (id as u32) << 8 | group as u32 };
+        *len += 1;
+        if *len == BATCH {
+            *len = 0;
+            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(batch);
+            self.drain(shared);
         }
+    }
+
+    /// Applies everything sent to this worker. Only the owner writes, so plain stores suffice.
+    fn drain(&mut self, shared: &Shared) {
+        std::mem::swap(&mut *shared.inboxes[self.me].lock().unwrap(), &mut self.spare);
+        for &entry in &self.spare {
+            let (id, group) = ((entry >> 8) as usize, (entry & 255) as usize);
+            let word = unsafe { shared.seen.get_unchecked((id >> 6) * shared.stride + group) };
+            word.store(word.load(Relaxed) | 1u64 << (id & 63), Relaxed);
+        }
+        self.spare.clear();
+    }
+
+    /// Sends what is left, then keeps applying until no worker can send any more.
+    fn finish(&mut self, shared: &Shared) {
+        for (line, (len, batch)) in self.pending.iter().enumerate() {
+            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(&batch[..*len]);
+        }
+        shared.finished.fetch_add(1, AcqRel);
+        while shared.finished.load(Acquire) < shared.inboxes.len() {
+            self.drain(shared);
+            std::hint::spin_loop();
+        }
+        self.drain(shared);
     }
 }
 
@@ -239,7 +289,7 @@ fn record_start(input: &[u8], mut from: usize) -> usize {
 }
 
 /// Aggregates the records of input[start..end] into this worker's groups.
-fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, groups: &mut [Group]) {
+fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker: &mut Worker) {
     let regions = shared.region_group.as_ptr();
     let last_region = shared.region_group.len() as u64 - 1;
     unsafe {
@@ -268,7 +318,7 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, groups
             p = amount_at.add(k + 1 + (*amount_at.add(k) == b'\r') as usize);
 
             let group = *regions.add(region.min(last_region) as usize) as usize;
-            let g = groups.get_unchecked_mut(group);
+            let g = worker.groups.get_unchecked_mut(group);
             g.count += 1;
             g.id_sum += id;
             g.amount_sum += amount;
@@ -276,32 +326,37 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, groups
             g.amount_max = g.amount_max.max(amount);
             g.name_bytes += name_len as u64;
             g.note_bytes += note_len as u64;
-            shared.mark_name(group, shared.name_id(hash_name(name, name_raw)));
+            worker.mark_name(shared, group, shared.name_id(hash_name(name, name_raw)));
         }
     }
 }
 
-/// Reads regions.csv into a flat table. Ids ascend, so the last line sizes it.
+/// Reads regions.csv into a flat table. Ids ascend, so the last line sizes it. A line is
+/// `id,CCC` + LF: walking it needs one word load per line and the code indexes a small array.
 fn load_regions(input: &[u8]) -> (Vec<u8>, Vec<[u8; 3]>) {
     let mut codes = vec![*b"___"]; // Group 0, UNMATCHED; only its position matters.
-    let mut index = BTreeMap::new();
+    let mut group_of_code = [0u8; 1 << 15];
     let last = input.rsplit(|&b| b == b'\n').nth(1).unwrap();
-    let mut table = vec![UNMATCHED as u8; number(&last[..last.len() - 4]) + 2];
-    for line in input.split(|&b| b == b'\n').skip(1).filter(|l| !l.is_empty()) {
-        let (id, code) = line.split_at(line.len() - 4);
-        let code: [u8; 3] = code[1..].try_into().unwrap();
-        let group = *index.entry(code).or_insert_with(|| {
-            codes.push(code);
-            codes.len() - 1
-        });
-        table[number(id)] = group as u8;
+    let max_id = last[..last.len() - 4].iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize);
+    let mut table = vec![UNMATCHED as u8; max_id + 2];
+    let header = input.iter().position(|&b| b == b'\n').unwrap() + 1;
+    unsafe {
+        let mut p = input.as_ptr().add(header);
+        let stop = input.as_ptr().add(input.len());
+        while p < stop {
+            let (id, next) = number_field(p);
+            let code = [*next, *next.add(1), *next.add(2)];
+            let key = code.iter().fold(0, |k, &c| k << 5 | (c & 31) as usize);
+            if group_of_code[key] == 0 {
+                codes.push(code);
+                group_of_code[key] = (codes.len() - 1) as u8;
+                assert!(codes.len() <= 256);
+            }
+            *table.get_unchecked_mut(id as usize) = group_of_code[key];
+            p = next.add(4);
+        }
     }
-    assert!(codes.len() <= 256);
     (table, codes)
-}
-
-fn number(digits: &[u8]) -> usize {
-    digits.iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize)
 }
 
 fn money(cents: i64) -> String {
@@ -314,13 +369,17 @@ fn main() {
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/records.csv"));
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
+    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let count = codes.len();
+    let stride = count.next_multiple_of(8);
     let shared = Shared {
         region_group,
-        groups: count,
         names: lazy_table(1 << ID_BITS),
         next_name: AtomicU32::new(0),
-        seen: lazy_table((1 << (ID_BITS - 6)) * count),
+        seen: lazy_table((1 << (ID_BITS - 6)) * stride),
+        stride,
+        inboxes: (0..threads).map(|_| Mutex::new(Vec::new())).collect(),
+        finished: AtomicUsize::new(0),
     };
 
     let first = input.iter().position(|&b| b == b'\n').map_or(input.len(), |i| i + 1);
@@ -330,20 +389,20 @@ fn main() {
         i => record_start(input, (first + i * (input.len() - first) / SEGMENTS - 1).max(first)),
     };
     let claim = AtomicUsize::new(0);
-    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let mut totals = vec![EMPTY; count];
     thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
-            .map(|_| {
+            .map(|me| {
                 let (shared, cut, claim) = (&shared, &cut, &claim);
                 scope.spawn(move || {
-                    let mut groups = vec![EMPTY; count];
+                    let mut worker = Worker::new(me, count);
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
                         if i >= SEGMENTS {
-                            return groups;
+                            worker.finish(shared);
+                            return worker.groups;
                         }
-                        parse_records(input, cut(i), cut(i + 1), shared, &mut groups);
+                        parse_records(input, cut(i), cut(i + 1), shared, &mut worker);
                     }
                 })
             })
@@ -364,7 +423,7 @@ fn main() {
     let rows = (shared.next_name.load(Relaxed) as usize >> 6) + 1;
     let mut lines = BTreeMap::new();
     for (group, t) in totals.iter().enumerate().filter(|(_, t)| t.count > 0) {
-        let distinct: u32 = (0..rows).map(|r| shared.seen[r * count + group].load(Relaxed).count_ones()).sum();
+        let distinct: u32 = (0..rows).map(|r| shared.seen[r * stride + group].load(Relaxed).count_ones()).sum();
         let key = if group == UNMATCHED { "_UNMATCHED".to_string() } else { String::from_utf8_lossy(&codes[group]).into_owned() };
         let line = format!(
             "{key} {} {} {} {} {} {distinct} {} {}\n",
