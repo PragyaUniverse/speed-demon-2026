@@ -1,0 +1,385 @@
+//! Track C: hostile CSV to per-country aggregates.
+//!
+//! The parser walks one field at a time with branch-free word tricks. Workers can start anywhere
+//! because a record start is recognisable without tracking quote state: the generator's text is
+//! letters and punctuation only (spec 2.2), so an LF followed by a digit or a BOM is always a real
+//! record boundary, and an LF inside a quoted note never is.
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::{env, ptr, slice, thread};
+
+const SEGMENTS: usize = 64;
+const UNMATCHED: usize = 0; // Group index; countries get 1, 2, ... in order of first appearance.
+
+// Names are interned in one shared table of 2^18 slots; the pool holds 100,000. A slot packs the
+// high hash bits with id + 1, and the slot index holds the low bits, so a match means all 64 hash
+// bits agree (about 1e-10 chance of any false match in a run).
+const ID_BITS: u32 = 18;
+const ID_MASK: u64 = (1 << ID_BITS) - 1;
+
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const MAP_PRIVATE: i32 = 2;
+const MAP_FIXED: i32 = 0x10;
+#[cfg(target_os = "linux")]
+const MAP_ANON: i32 = 0x20;
+#[cfg(not(target_os = "linux"))]
+const MAP_ANON: i32 = 0x1000;
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+}
+
+/// Maps a file with one zeroed page behind it, so word reads may run past the end of the data.
+fn map_file(path: String) -> &'static [u8] {
+    let file = File::open(path).unwrap();
+    let len = file.metadata().unwrap().len() as usize;
+    unsafe {
+        let base = mmap(ptr::null_mut(), len + 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if len > 0 {
+            assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0), base);
+        }
+        slice::from_raw_parts(base, len)
+    }
+}
+
+/// Zeroed atomics that cost memory only where they are touched.
+fn lazy_table<T>(n: usize) -> &'static [T] {
+    let bytes = n * std::mem::size_of::<T>();
+    unsafe {
+        let p = mmap(ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        slice::from_raw_parts(p as *const T, n)
+    }
+}
+
+#[inline(always)]
+unsafe fn load(p: *const u8) -> u64 {
+    (p as *const u64).read_unaligned()
+}
+
+const LOW: u64 = 0x0101010101010101;
+const HIGH: u64 = 0x8080808080808080;
+
+/// Byte index of the first zero byte of the little-endian word, 8 if there is none.
+#[inline(always)]
+fn first_zero(word: u64) -> usize {
+    (((word.wrapping_sub(LOW) & !word & HIGH).trailing_zeros()) / 8) as usize
+}
+
+/// Byte index of the first byte equal to `b`, 8 if there is none.
+#[inline(always)]
+fn first_byte(word: u64, b: u8) -> usize {
+    first_zero(word ^ (b as u64 * LOW))
+}
+
+/// Combines up to 8 ASCII digits sitting in the high bytes of `word`, one multiply per level.
+#[inline(always)]
+fn digits8(word: u64) -> u64 {
+    let v = word & 0x0F0F0F0F0F0F0F0F;
+    let v = (v.wrapping_mul(2561) >> 8) & 0x00FF00FF00FF00FF;
+    let v = (v.wrapping_mul(6553601) >> 16) & 0x0000FFFF0000FFFF;
+    v.wrapping_mul(42949672960001) >> 32
+}
+
+/// Parses a decimal field of 1 to 8 digits ending in a comma; returns it and the next field.
+#[inline(always)]
+unsafe fn number_field(p: *const u8) -> (u64, *const u8) {
+    let word = load(p);
+    let k = first_byte(word, b',');
+    (digits8(word << (64 - 8 * k)), p.add(k + 1))
+}
+
+/// Distance to the next `b`, which is known to exist.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn until(p: *const u8, b: u8) -> usize {
+    use std::arch::x86_64::*;
+    let needle = _mm256_set1_epi8(b as i8);
+    let mut n = 0;
+    loop {
+        let v = _mm256_loadu_si256(p.add(n) as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;
+        if m != 0 {
+            return n + m.trailing_zeros() as usize;
+        }
+        n += 32;
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn until(p: *const u8, b: u8) -> usize {
+    let mut n = 0;
+    loop {
+        let k = first_byte(load(p.add(n)), b);
+        if k < 8 {
+            return n + k;
+        }
+        n += 8;
+    }
+}
+
+/// A text field: its content bytes as written, its unescaped length, and where the next field is.
+/// Raw content is safe to compare: `""` is the only escape and unquoted text cannot contain a quote.
+#[inline(always)]
+unsafe fn text_field(p: *const u8) -> (*const u8, usize, usize, *const u8) {
+    if *p != b'"' {
+        let n = until(p, b',');
+        return (p, n, n, p.add(n + 1));
+    }
+    let start = p.add(1);
+    let (mut q, mut escapes) = (start, 0);
+    loop {
+        q = q.add(until(q, b'"'));
+        if *q.add(1) != b'"' {
+            break;
+        }
+        q = q.add(2);
+        escapes += 1;
+    }
+    let raw = q as usize - start as usize;
+    (start, raw, raw - escapes, q.add(2))
+}
+
+/// Multiply-mix over all bytes of the name, with a masked load so that nothing past it counts.
+#[inline(always)]
+unsafe fn hash_name(p: *const u8, len: usize) -> u64 {
+    const K: u64 = 0x9E3779B97F4A7C15;
+    let mut h = (len as u64).wrapping_mul(K);
+    let mut i = 0;
+    while i + 8 < len {
+        h = (h ^ load(p.add(i))).wrapping_mul(K).rotate_left(29);
+        i += 8;
+    }
+    if len > 0 {
+        let rest = len - i; // 1 to 8 bytes.
+        h = (h ^ (load(p.add(i)) & (u64::MAX >> (64 - 8 * rest)))).wrapping_mul(K);
+    }
+    h ^ (h >> 32)
+}
+
+#[derive(Clone, Copy)]
+struct Group {
+    count: u64,
+    id_sum: u64,
+    amount_sum: i64,
+    amount_min: i64,
+    amount_max: i64,
+    name_bytes: u64,
+    note_bytes: u64,
+}
+
+const EMPTY: Group = Group {
+    count: 0,
+    id_sum: 0,
+    amount_sum: 0,
+    amount_min: i64::MAX,
+    amount_max: i64::MIN,
+    name_bytes: 0,
+    note_bytes: 0,
+};
+
+/// State shared by the workers while they parse.
+struct Shared {
+    /// region_id -> group index; one extra zero at the end catches every larger region_id.
+    region_group: Vec<u8>,
+    groups: usize,
+    names: &'static [AtomicU64],
+    next_name: AtomicU32,
+    /// Bit matrix: one row of `groups` words per 64 name ids, so ids stay dense in memory.
+    seen: &'static [AtomicU64],
+}
+
+impl Shared {
+    /// Dense id of a name, claiming a slot and an id if it is new.
+    #[inline(always)]
+    fn name_id(&self, hash: u64) -> usize {
+        let tag = hash & !ID_MASK;
+        let mut slot = (hash & ID_MASK) as usize;
+        loop {
+            let entry = unsafe { self.names.get_unchecked(slot) }.load(Relaxed);
+            if entry & !ID_MASK == tag && entry != 0 {
+                return (entry & ID_MASK) as usize - 1;
+            }
+            if entry == 0 {
+                let id = self.next_name.fetch_add(1, Relaxed) as u64;
+                assert!(id < ID_MASK);
+                if self.names[slot].compare_exchange(0, tag | (id + 1), Relaxed, Relaxed).is_ok() {
+                    return id as usize;
+                }
+                continue; // Lost the race: the winner may have stored this very name.
+            }
+            slot = (slot + 1) & ID_MASK as usize;
+        }
+    }
+
+    #[inline(always)]
+    fn mark_name(&self, group: usize, id: usize) {
+        let word = unsafe { self.seen.get_unchecked((id >> 6) * self.groups + group) };
+        let bit = 1u64 << (id & 63);
+        // Most repeats avoid the locked instruction and its store-buffer drain.
+        if word.load(Relaxed) & bit == 0 {
+            word.fetch_or(bit, Relaxed);
+        }
+    }
+}
+
+/// First record start at or after `from`, per the module comment.
+fn record_start(input: &[u8], mut from: usize) -> usize {
+    while from < input.len() {
+        if input[from] == b'\n' && input.get(from + 1).is_some_and(|&b| b.is_ascii_digit() || b == 0xEF) {
+            return from + 1;
+        }
+        from += 1;
+    }
+    input.len()
+}
+
+/// Aggregates the records of input[start..end] into this worker's groups.
+fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, groups: &mut [Group]) {
+    let regions = shared.region_group.as_ptr();
+    let last_region = shared.region_group.len() as u64 - 1;
+    unsafe {
+        let mut p = input.as_ptr().add(start);
+        let stop = input.as_ptr().add(end);
+        while p < stop {
+            if *p == 0xEF {
+                p = p.add(3);
+            }
+            let (id, next) = number_field(p);
+            let (name, name_raw, name_len, next) = text_field(next);
+            let (_, _, note_len, next) = text_field(next);
+            let (region, next) = number_field(next);
+
+            // Amount: `-?digits.dd` of at most 8 characters after the sign, then CR or LF. Only
+            // those terminators have a zero high nibble. The sign and the CR are handled without
+            // branches because both are unpredictable.
+            let negative = (*next == b'-') as usize;
+            let amount_at = next.add(negative);
+            let word = load(amount_at);
+            let k = first_zero(word & 0xF0F0F0F0F0F0F0F0);
+            let aligned = word << (64 - 8 * k); // Bytes 6 and 7 are the cents, byte 5 is the dot.
+            let squeezed = ((aligned & 0xFF_FFFF_FFFF) << 8) | (aligned & 0xFFFF_0000_0000_0000);
+            let value = digits8(squeezed) as i64;
+            let amount = (value ^ -(negative as i64)) + negative as i64;
+            p = amount_at.add(k + 1 + (*amount_at.add(k) == b'\r') as usize);
+
+            let group = *regions.add(region.min(last_region) as usize) as usize;
+            let g = groups.get_unchecked_mut(group);
+            g.count += 1;
+            g.id_sum += id;
+            g.amount_sum += amount;
+            g.amount_min = g.amount_min.min(amount);
+            g.amount_max = g.amount_max.max(amount);
+            g.name_bytes += name_len as u64;
+            g.note_bytes += note_len as u64;
+            shared.mark_name(group, shared.name_id(hash_name(name, name_raw)));
+        }
+    }
+}
+
+/// Reads regions.csv into a flat table. Ids ascend, so the last line sizes it.
+fn load_regions(input: &[u8]) -> (Vec<u8>, Vec<[u8; 3]>) {
+    let mut codes = vec![*b"___"]; // Group 0, UNMATCHED; only its position matters.
+    let mut index = BTreeMap::new();
+    let last = input.rsplit(|&b| b == b'\n').nth(1).unwrap();
+    let mut table = vec![UNMATCHED as u8; number(&last[..last.len() - 4]) + 2];
+    for line in input.split(|&b| b == b'\n').skip(1).filter(|l| !l.is_empty()) {
+        let (id, code) = line.split_at(line.len() - 4);
+        let code: [u8; 3] = code[1..].try_into().unwrap();
+        let group = *index.entry(code).or_insert_with(|| {
+            codes.push(code);
+            codes.len() - 1
+        });
+        table[number(id)] = group as u8;
+    }
+    assert!(codes.len() <= 256);
+    (table, codes)
+}
+
+fn number(digits: &[u8]) -> usize {
+    digits.iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize)
+}
+
+fn money(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    format!("{sign}{}.{:02}", cents.unsigned_abs() / 100, cents.unsigned_abs() % 100)
+}
+
+fn main() {
+    let data = env::var("SD_DATA").unwrap_or("/data".into());
+    let out = env::var("SD_OUT").unwrap_or("/out".into());
+    let input = map_file(format!("{data}/records.csv"));
+    let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
+    let count = codes.len();
+    let shared = Shared {
+        region_group,
+        groups: count,
+        names: lazy_table(1 << ID_BITS),
+        next_name: AtomicU32::new(0),
+        seen: lazy_table((1 << (ID_BITS - 6)) * count),
+    };
+
+    let first = input.iter().position(|&b| b == b'\n').map_or(input.len(), |i| i + 1);
+    let cut = |i: usize| match i {
+        0 => first,
+        i if i >= SEGMENTS => input.len(),
+        i => record_start(input, (first + i * (input.len() - first) / SEGMENTS - 1).max(first)),
+    };
+    let claim = AtomicUsize::new(0);
+    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
+    let mut totals = vec![EMPTY; count];
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let (shared, cut, claim) = (&shared, &cut, &claim);
+                scope.spawn(move || {
+                    let mut groups = vec![EMPTY; count];
+                    loop {
+                        let i = claim.fetch_add(1, Relaxed);
+                        if i >= SEGMENTS {
+                            return groups;
+                        }
+                        parse_records(input, cut(i), cut(i + 1), shared, &mut groups);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (t, g) in totals.iter_mut().zip(worker.join().unwrap()) {
+                t.count += g.count;
+                t.id_sum += g.id_sum;
+                t.amount_sum += g.amount_sum;
+                t.amount_min = t.amount_min.min(g.amount_min);
+                t.amount_max = t.amount_max.max(g.amount_max);
+                t.name_bytes += g.name_bytes;
+                t.note_bytes += g.note_bytes;
+            }
+        }
+    });
+
+    let rows = (shared.next_name.load(Relaxed) as usize >> 6) + 1;
+    let mut lines = BTreeMap::new();
+    for (group, t) in totals.iter().enumerate().filter(|(_, t)| t.count > 0) {
+        let distinct: u32 = (0..rows).map(|r| shared.seen[r * count + group].load(Relaxed).count_ones()).sum();
+        let key = if group == UNMATCHED { "_UNMATCHED".to_string() } else { String::from_utf8_lossy(&codes[group]).into_owned() };
+        let line = format!(
+            "{key} {} {} {} {} {} {distinct} {} {}\n",
+            t.count,
+            t.id_sum,
+            money(t.amount_sum),
+            money(t.amount_min),
+            money(t.amount_max),
+            t.name_bytes,
+            t.note_bytes
+        );
+        lines.insert(key, line);
+    }
+    let mut output = File::create(format!("{out}/aggregates.txt")).unwrap();
+    output.write_all(lines.into_values().collect::<String>().as_bytes()).unwrap();
+    // Skip unmapping and destructors: the process is done and the clock is running.
+    std::process::exit(0);
+}
