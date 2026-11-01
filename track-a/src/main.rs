@@ -30,10 +30,6 @@ const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
-#[cfg(target_os = "linux")]
-const MAP_POPULATE: i32 = 0x8000;
-#[cfg(not(target_os = "linux"))]
-const MAP_POPULATE: i32 = 0;
 const MADV_DONTNEED: i32 = 4; // Drops the pages at once.
 #[cfg(target_os = "linux")]
 const MAP_ANON: i32 = 0x20;
@@ -57,7 +53,7 @@ fn reserve(bytes: usize) -> *mut u8 {
 fn map_input(file: &File, len: usize) -> &'static [u8] {
     unsafe {
         let base = reserve(len + 4096);
-        let got = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, file.as_raw_fd(), 0);
+        let got = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
         assert_eq!(got, base);
         slice::from_raw_parts(base, len)
     }

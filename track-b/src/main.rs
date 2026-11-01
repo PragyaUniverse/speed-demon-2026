@@ -20,10 +20,6 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 #[cfg(target_os = "linux")]
-const MAP_POPULATE: i32 = 0x8000;
-#[cfg(not(target_os = "linux"))]
-const MAP_POPULATE: i32 = 0;
-#[cfg(target_os = "linux")]
 const MAP_ANON: i32 = 0x20;
 #[cfg(not(target_os = "linux"))]
 const MAP_ANON: i32 = 0x1000;
@@ -41,7 +37,7 @@ fn map_file(path: String) -> &'static [u8] {
     unsafe {
         let base = mmap(ptr::null_mut(), len + 128 * 1024, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
         if len > 0 {
-            assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, file.as_raw_fd(), 0), base);
+            assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0), base);
         }
         slice::from_raw_parts(base, len)
     }
