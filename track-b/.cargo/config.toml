@@ -1,4 +1,4 @@
 # x86-64-v3 is exactly what the scoring CPU offers (AVX2, BMI2, no AVX-512), whichever machine builds.
 # Static linking skips the dynamic loader. The profile comes from tools/pgo.sh, on generator output.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static", "-C", "profile-use=/src/pgo.profdata"]

@@ -34,6 +34,8 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
+    #[cfg(target_os = "linux")]
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
 
 /// Maps a file with one zeroed page behind it, so word reads may run past the end of the data.
@@ -366,6 +368,17 @@ fn money(cents: i64) -> String {
     format!("{sign}{}.{:02}", cents.unsigned_abs() / 100, cents.unsigned_abs() % 100)
 }
 
+/// Keeps this worker on one logical CPU, so that its cached table lines stay with it.
+fn pin(cpu: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mask: u64 = 1 << cpu;
+        sched_setaffinity(0, 8, &mask);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cpu;
+}
+
 fn main() {
     // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
     #[cfg(target_os = "linux")]
@@ -377,7 +390,7 @@ fn main() {
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/records.csv"));
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
-    let threads = 6;
+    let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let count = codes.len();
     let stride = count.next_multiple_of(8);
     let shared = Shared {
@@ -403,6 +416,7 @@ fn main() {
             .map(|me| {
                 let (shared, cut, claim) = (&shared, &cut, &claim);
                 scope.spawn(move || {
+                    pin(me);
                     let mut worker = Worker::new(me, count);
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
