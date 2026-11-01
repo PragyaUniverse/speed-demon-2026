@@ -391,6 +391,7 @@ fn main() {
     });
     let segments: Vec<Segment> = pending.into_iter().map(|m| m.into_inner().unwrap()).collect();
 
+    std::process::exit(3); // PROBE
     // Bytewise order of the endpoints, shared by every hour.
     let mut order: Vec<(usize, &[u8])> =
         (0..SLOTS).map(|s| (s, names.name(s))).filter(|e| !e.1.is_empty()).collect();

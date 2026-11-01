@@ -646,6 +646,7 @@ fn main() {
     let frequency = sample_frequencies(&q, &input[..sample_end]);
     let plan = make_plan(&mut q, &frequency);
 
+    std::process::exit(3); // PROBE
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let chunks = input.len().div_ceil(CHUNK_BYTES);
     let shared = Shared {

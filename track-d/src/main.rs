@@ -600,6 +600,7 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let (rank, graph) = Graph::parse(map_file(format!("{data}/graph.txt")));
+    std::process::exit(3); // PROBE
     let text = std::fs::read(format!("{data}/queries.txt")).unwrap();
     let mut queries = Vec::new();
     let mut fields = text.split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty()).map(|f| {
