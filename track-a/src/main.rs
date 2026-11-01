@@ -356,7 +356,6 @@ fn format_hour(bucket: usize, segments: &[Segment], order: &[(usize, &[u8])], s:
 }
 
 fn main() {
-    std::process::exit(3); // PROBE
     // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
     #[cfg(target_os = "linux")]
     unsafe {

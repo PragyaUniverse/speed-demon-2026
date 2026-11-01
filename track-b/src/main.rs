@@ -651,12 +651,6 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/docs.txt")).unwrap();
-    { // PROBE
-        let len = file.metadata().unwrap().len() as usize; // PROBE
-        let at = AtomicUsize::new(0); // PROBE
-        thread::scope(|sc| { for _ in 0..12 { sc.spawn(|| { let mut b = vec![0u8; 1 << 18]; loop { let o = at.fetch_add(1 << 18, Relaxed); if o >= len { return; } let _ = file.read_at(&mut b, o as u64); std::hint::black_box(&b); } }); } }); // PROBE
-        std::process::exit(3); // PROBE
-    } // PROBE
     let len = file.metadata().unwrap().len() as usize;
     let mut q = parse_queries(std::fs::read(format!("{data}/queries.txt")).unwrap().leak());
     let sample_end = doc_start(&file, len, SAMPLE_BYTES);
