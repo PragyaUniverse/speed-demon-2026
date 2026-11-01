@@ -32,3 +32,6 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
 | b9545ea | 64-byte quote search, loop-free hash for short names | run-779fd07fbc9d | 42.5 | 9.9 | Second sample run-b0c5f801f0ee 41.2. **No gain, reverted** |
 | d271ae5 | PROBE: touch every cache line of the mapping, no parsing | run-22cb43d6855b | 11.3 | 8.2 | Input alone costs 11.3 ms, leaving about 30 ms of my compute |
+| ccb00ab | Two-stage parser: bitmask separators, then records from positions, as in simdjson | run-bb071a46549d | 50.6 | 12.4 | Second sample run-9451af89c7c6 46.0. Correct first time, but slower by about 15%, 70 lines longer and 2.5 MB bigger. The most interesting failure here: I expected branch mispredictions to be the cost, and this removed nearly all of them. **Reverted** |
+| e2ffea4 | 6 threads instead of 12 | run-553e6c388abb | 53.7 | 10.2 | 1.3x from the second hyperthreads. About 240 cycles per record on a whole core. **Reverted** |
+| 013f9b2 | Pin each worker to one logical CPU | run-74b5c19678d9 | 40.9 | 9.9 | Second sample run-22bf09839ea6 41.9. **No gain for 12 lines, reverted** |

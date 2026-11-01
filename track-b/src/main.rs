@@ -24,8 +24,6 @@ const STRIDE: usize = 1 << (REL_BITS - 6); // Words per bitset row, enough for a
 extern "C" {
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
-    #[cfg(target_os = "linux")]
-    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
 
 #[inline(always)]
@@ -643,17 +641,6 @@ fn push_number(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
-/// Keeps this worker on one logical CPU, so that its cached table lines stay with it.
-fn pin(cpu: usize) {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mask: u64 = 1 << cpu;
-        sched_setaffinity(0, 8, &mask);
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = cpu;
-}
-
 fn main() {
     // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
     #[cfg(target_os = "linux")]
@@ -685,23 +672,21 @@ fn main() {
     let claim = AtomicUsize::new(0);
     let hit_lists: Vec<Vec<(u32, u32)>> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|me| {
-                let (q, plan, shared, firsts, claim, file) = (&q, &plan, &shared, &firsts, &claim, &file);
-                scope.spawn(move || {
-                    pin(me);
-                    let mut worker = Worker::new(q, plan);
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut worker = Worker::new(&q, &plan);
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
                         if i >= chunks {
                             return std::mem::take(&mut worker.hits);
                         }
-                        let (from, to) = (doc_start(file, len, i * CHUNK_BYTES), doc_start(file, len, (i + 1) * CHUNK_BYTES));
-                        let (base, docs) = worker.scan(file, from, to, shared);
+                        let (from, to) = (doc_start(&file, len, i * CHUNK_BYTES), doc_start(&file, len, (i + 1) * CHUNK_BYTES));
+                        let (base, docs) = worker.scan(&file, from, to, &shared);
                         let words = docs.div_ceil(64).max(1);
                         worker.invert(words, plan.frequent);
                         let mut slot = firsts[i].lock().unwrap();
                         slot.base = base;
-                        worker.answer_bools(base, words, shared, &mut slot.entries);
+                        worker.answer_bools(base, words, &shared, &mut slot.entries);
                     }
                 })
             })
