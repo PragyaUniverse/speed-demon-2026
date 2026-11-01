@@ -32,6 +32,8 @@ const MAP_ANON: i32 = 0x1000;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    #[cfg(target_os = "linux")]
+    fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
 }
 
 /// Maps a file with one zeroed page behind it, so word reads may run past the end of the data.
@@ -365,6 +367,12 @@ fn money(cents: i64) -> String {
 }
 
 fn main() {
+    // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const PR_SET_THP_DISABLE: i32 = 41;
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
     diag("start");
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
