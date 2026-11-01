@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{env, ptr, thread};
 
-const CHUNK_BYTES: usize = 1 << 22;
-const REL_BITS: u32 = 13; // A 4 MB chunk holds about 4,000 documents; asserted to fit in 8,192.
+const CHUNK_BYTES: usize = 1 << 21;
+const REL_BITS: u32 = 12; // A 2 MB chunk holds about 2,000 documents; asserted to fit in 4,096.
 const SAMPLE_BYTES: usize = 1 << 18;
 const READ_BYTES: usize = 1 << 18;
 const PAD: usize = 128;

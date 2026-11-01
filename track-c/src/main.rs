@@ -1,6 +1,6 @@
 //! Track C: hostile CSV to per-country aggregates.
 //!
-//! The parser finds separators with bitmasks, then parses records from their positions. Workers can start anywhere
+//! The parser walks one field at a time with branch-free word tricks. Workers can start anywhere
 //! because a record start is recognisable without tracking quote state: the generator's text is
 //! letters and punctuation only (spec 2.2), so an LF followed by a digit or a BOM is always a real
 //! record boundary, and an LF inside a quoted note never is.
@@ -95,32 +95,56 @@ unsafe fn number_field(p: *const u8) -> (u64, *const u8) {
     (digits8(word << (64 - 8 * k)), p.add(k + 1))
 }
 
-/// Bits set at double quotes, and at commas and LFs, for the 64 bytes at `p`.
+/// Distance to the next `b`, which is known to exist.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
-unsafe fn classify(p: *const u8) -> (u64, u64) {
+unsafe fn until(p: *const u8, b: u8) -> usize {
     use std::arch::x86_64::*;
-    let half = |q: *const u8| {
-        let v = _mm256_loadu_si256(q as *const __m256i);
-        let eq = |b: u8| _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b as i8));
-        let quotes = _mm256_movemask_epi8(eq(b'"')) as u32 as u64;
-        let seps = _mm256_movemask_epi8(_mm256_or_si256(eq(b','), eq(b'\n'))) as u32 as u64;
-        (quotes, seps)
-    };
-    let (a, b) = (half(p), half(p.add(32)));
-    (a.0 | b.0 << 32, a.1 | b.1 << 32)
+    let needle = _mm256_set1_epi8(b as i8);
+    let mut n = 0;
+    loop {
+        let v = _mm256_loadu_si256(p.add(n) as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;
+        if m != 0 {
+            return n + m.trailing_zeros() as usize;
+        }
+        n += 32;
+    }
 }
 
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn classify(p: *const u8) -> (u64, u64) {
-    let (mut quotes, mut seps) = (0, 0);
-    for i in 0..64 {
-        let b = *p.add(i);
-        quotes |= ((b == b'"') as u64) << i;
-        seps |= ((b == b',' || b == b'\n') as u64) << i;
+unsafe fn until(p: *const u8, b: u8) -> usize {
+    let mut n = 0;
+    loop {
+        let k = first_byte(load(p.add(n)), b);
+        if k < 8 {
+            return n + k;
+        }
+        n += 8;
     }
-    (quotes, seps)
+}
+
+/// A text field: its content bytes as written, its unescaped length, and where the next field is.
+/// Raw content is safe to compare: `""` is the only escape and unquoted text cannot contain a quote.
+#[inline(always)]
+unsafe fn text_field(p: *const u8) -> (*const u8, usize, usize, *const u8) {
+    if *p != b'"' {
+        let n = until(p, b',');
+        return (p, n, n, p.add(n + 1));
+    }
+    let start = p.add(1);
+    let (mut q, mut escapes) = (start, 0);
+    loop {
+        q = q.add(until(q, b'"'));
+        if *q.add(1) != b'"' {
+            break;
+        }
+        q = q.add(2);
+        escapes += 1;
+    }
+    let raw = q as usize - start as usize;
+    (start, raw, raw - escapes, q.add(2))
 }
 
 /// Multiply-mix over all bytes of the name, with a masked load so that nothing past it counts.
@@ -210,13 +234,11 @@ struct Worker {
     groups: Vec<Group>,
     pending: Vec<(usize, [u32; BATCH])>,
     spare: Vec<u32>,
-    separators: Vec<u32>,
-    escapes: Vec<u32>,
 }
 
 impl Worker {
     fn new(me: usize, count: usize) -> Self {
-        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new(), separators: vec![0; SEPARATORS + 64], escapes: Vec::new() }
+        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new() }
     }
 
     #[inline(always)]
@@ -268,123 +290,47 @@ fn record_start(input: &[u8], mut from: usize) -> usize {
     input.len()
 }
 
-const FIELDS: usize = 5; // Every record has exactly four commas and one LF outside quotes.
-const SEPARATORS: usize = 1 << 13;
-
-/// Aggregates the records of input[start..end], both record starts, in two stages. Stage one finds
-/// every separator outside quotes with bitmasks: a running XOR of the quote bits marks what is
-/// inside quotes, so `""` and quoted commas and LFs need no special case. Stage two parses records
-/// straight from that list, where a field's length is a subtraction and decides no branch.
+/// Aggregates the records of input[start..end] into this worker's groups.
 fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker: &mut Worker) {
-    let mut seps = std::mem::take(&mut worker.separators);
-    let mut escapes = std::mem::take(&mut worker.escapes);
-    escapes.clear();
-    let (mut count, mut used_escapes, mut record) = (0, 0, start);
-    let (mut position, mut in_quotes, mut last_quote) = (start, 0u64, 0u64);
+    let regions = shared.region_group.as_ptr();
+    let last_region = shared.region_group.len() as u64 - 1;
     unsafe {
-        while position < end {
-            while position < end && count + 64 <= SEPARATORS {
-                let (quotes, commas_lfs) = classify(input.as_ptr().add(position));
-                let keep = if end - position < 64 { (1u64 << (end - position)) - 1 } else { u64::MAX };
-                let quotes = quotes & keep;
-                let mut inside = quotes;
-                for shift in [1, 2, 4, 8, 16, 32] {
-                    inside ^= inside << shift;
-                }
-                inside ^= in_quotes;
-                in_quotes = ((inside as i64) >> 63) as u64;
-                // A quote right after a quote that reopens the field is the second half of `""`.
-                let mut reopened = quotes & (quotes << 1 | last_quote) & inside;
-                last_quote = quotes >> 63;
-                while reopened != 0 {
-                    escapes.push((position + reopened.trailing_zeros() as usize) as u32);
-                    reopened &= reopened - 1;
-                }
-                let mut found = commas_lfs & keep & !inside;
-                let n = found.count_ones() as usize;
-                let out = seps.as_mut_ptr().add(count);
-                // Eight writes cover almost every block, with no branch on the exact number.
-                for i in 0..8 {
-                    *out.add(i) = (position + found.trailing_zeros() as usize) as u32;
-                    found &= found.wrapping_sub(1);
-                }
-                let mut i = 8;
-                while found != 0 {
-                    *out.add(i) = (position + found.trailing_zeros() as usize) as u32;
-                    found &= found - 1;
-                    i += 1;
-                }
-                count += n;
-                position += 64;
+        let mut p = input.as_ptr().add(start);
+        let stop = input.as_ptr().add(end);
+        while p < stop {
+            if *p == 0xEF {
+                p = p.add(3);
             }
-            let records = count / FIELDS;
-            for r in 0..records {
-                let s = seps.as_ptr().add(r * FIELDS);
-                record = parse_record(input, record, s, &escapes, &mut used_escapes, shared, worker);
-            }
-            let rest = count - records * FIELDS;
-            seps.copy_within(records * FIELDS..count, 0);
-            count = rest;
+            let (id, next) = number_field(p);
+            let (name, name_raw, name_len, next) = text_field(next);
+            let (_, _, note_len, next) = text_field(next);
+            let (region, next) = number_field(next);
+
+            // Amount: `-?digits.dd` of at most 8 characters after the sign, then CR or LF. Only
+            // those terminators have a zero high nibble. The sign and the CR are handled without
+            // branches because both are unpredictable.
+            let negative = (*next == b'-') as usize;
+            let amount_at = next.add(negative);
+            let word = load(amount_at);
+            let k = first_zero(word & 0xF0F0F0F0F0F0F0F0);
+            let aligned = word << (64 - 8 * k); // Bytes 6 and 7 are the cents, byte 5 is the dot.
+            let squeezed = ((aligned & 0xFF_FFFF_FFFF) << 8) | (aligned & 0xFFFF_0000_0000_0000);
+            let value = digits8(squeezed) as i64;
+            let amount = (value ^ -(negative as i64)) + negative as i64;
+            p = amount_at.add(k + 1 + (*amount_at.add(k) == b'\r') as usize);
+
+            let group = *regions.add(region.min(last_region) as usize) as usize;
+            let g = worker.groups.get_unchecked_mut(group);
+            g.count += 1;
+            g.id_sum += id;
+            g.amount_sum += amount;
+            g.amount_min = g.amount_min.min(amount);
+            g.amount_max = g.amount_max.max(amount);
+            g.name_bytes += name_len as u64;
+            g.note_bytes += note_len as u64;
+            worker.mark_name(shared, group, shared.name_id(hash_name(name, name_raw)));
         }
     }
-    worker.separators = seps;
-    worker.escapes = escapes;
-}
-
-/// Parses one record given its five separators; returns where the next one starts.
-#[inline(always)]
-unsafe fn parse_record(
-    input: &[u8],
-    record: usize,
-    s: *const u32,
-    escapes: &[u32],
-    used: &mut usize,
-    shared: &Shared,
-    worker: &mut Worker,
-) -> usize {
-    let base = input.as_ptr();
-    let (name_comma, note_comma) = (*s as usize, *s.add(1) as usize);
-    let (region_comma, amount_comma, lf) = (*s.add(2) as usize, *s.add(3) as usize, *s.add(4) as usize);
-    let id_at = record + (*base.add(record) == 0xEF) as usize * 3;
-    let number = |at: usize, end: usize| digits8(load(base.add(at)) << (64 - 8 * (end - at)));
-    let id = number(id_at, name_comma);
-    let region = number(region_comma + 1, amount_comma);
-
-    // A text field's content, without quotes when it has them, and how many `""` it holds.
-    let mut text = |at: usize, end: usize| {
-        let quoted = (*base.add(at) == b'"') as usize;
-        let mut pairs = 0;
-        while *used < escapes.len() && (*escapes.get_unchecked(*used) as usize) < end {
-            *used += 1;
-            pairs += 1;
-        }
-        (at + quoted, end - at - 2 * quoted, pairs)
-    };
-    let (name, name_raw, name_pairs) = text(name_comma + 1, note_comma);
-    let (_, note_raw, note_pairs) = text(note_comma + 1, region_comma);
-
-    // Amount: `-?digits.dd` of at most 8 characters after the sign, before an optional CR. The
-    // sign and the CR are handled without branches because both are unpredictable.
-    let negative = (*base.add(amount_comma + 1) == b'-') as usize;
-    let amount_at = amount_comma + 1 + negative;
-    let k = lf - amount_at - (*base.add(lf - 1) == b'\r') as usize;
-    let aligned = load(base.add(amount_at)) << (64 - 8 * k); // Bytes 6 and 7 are the cents, byte 5 the dot.
-    let squeezed = ((aligned & 0xFF_FFFF_FFFF) << 8) | (aligned & 0xFFFF_0000_0000_0000);
-    let value = digits8(squeezed) as i64;
-    let amount = (value ^ -(negative as i64)) + negative as i64;
-
-    let last_region = shared.region_group.len() as u64 - 1;
-    let group = *shared.region_group.as_ptr().add(region.min(last_region) as usize) as usize;
-    let g = worker.groups.get_unchecked_mut(group);
-    g.count += 1;
-    g.id_sum += id;
-    g.amount_sum += amount;
-    g.amount_min = g.amount_min.min(amount);
-    g.amount_max = g.amount_max.max(amount);
-    g.name_bytes += (name_raw - name_pairs) as u64;
-    g.note_bytes += (note_raw - note_pairs) as u64;
-    worker.mark_name(shared, group, shared.name_id(hash_name(base.add(name), name_raw)));
-    lf + 1
 }
 
 /// Reads regions.csv into a flat table. Ids ascend, so the last line sizes it. A line is
