@@ -7,12 +7,15 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const SEGMENTS: usize = 64;
+const READ_BYTES: usize = 1 << 18;
+const PAD: usize = 64;
 const UNMATCHED: usize = 0; // Group index; countries get 1, 2, ... in order of first appearance.
 
 // Names are interned in one shared table of 2^18 slots; the pool holds 100,000. A slot packs the
@@ -290,13 +293,33 @@ fn record_start(input: &[u8], mut from: usize) -> usize {
     input.len()
 }
 
-/// Aggregates the records of input[start..end] into this worker's groups.
-fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker: &mut Worker) {
+/// Aggregates the records in the file range [start, end), both record starts, into this worker's
+/// groups. The bytes are read into a buffer small enough to stay in this core's L2 during parsing.
+fn parse_range(file: &File, start: usize, end: usize, shared: &Shared, worker: &mut Worker, buffer: &mut [u8]) {
+    let capacity = buffer.len() - PAD;
+    let mut position = start;
+    while position < end {
+        let wanted = capacity.min(end - position);
+        file.read_exact_at(&mut buffer[..wanted], position as u64).unwrap();
+        buffer[wanted..wanted + PAD].fill(0);
+        // Whole records only: stop at the last record start unless this piece ends the range.
+        let whole = if position + wanted == end {
+            wanted
+        } else {
+            (0..wanted - 1).rev().find(|&i| buffer[i] == b'\n' && (buffer[i + 1].is_ascii_digit() || buffer[i + 1] == 0xEF)).unwrap() + 1
+        };
+        parse_records(&buffer[..whole], shared, worker);
+        position += whole;
+    }
+}
+
+/// Aggregates complete records into this worker's groups; word loads may run past the slice.
+fn parse_records(lines: &[u8], shared: &Shared, worker: &mut Worker) {
     let regions = shared.region_group.as_ptr();
     let last_region = shared.region_group.len() as u64 - 1;
     unsafe {
-        let mut p = input.as_ptr().add(start);
-        let stop = input.as_ptr().add(end);
+        let mut p = lines.as_ptr();
+        let stop = p.add(lines.len());
         while p < stop {
             if *p == 0xEF {
                 p = p.add(3);
@@ -375,6 +398,7 @@ fn main() {
     }
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
+    let file = File::open(format!("{data}/records.csv")).unwrap();
     let input = map_file(format!("{data}/records.csv"));
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
@@ -401,16 +425,17 @@ fn main() {
     thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|me| {
-                let (shared, cut, claim) = (&shared, &cut, &claim);
+                let (shared, cut, claim, file) = (&shared, &cut, &claim, &file);
                 scope.spawn(move || {
                     let mut worker = Worker::new(me, count);
+                    let mut buffer = vec![0u8; READ_BYTES + PAD];
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
                         if i >= SEGMENTS {
                             worker.finish(shared);
                             return worker.groups;
                         }
-                        parse_records(input, cut(i), cut(i + 1), shared, &mut worker);
+                        parse_range(file, cut(i), cut(i + 1), shared, &mut worker, &mut buffer);
                     }
                 })
             })

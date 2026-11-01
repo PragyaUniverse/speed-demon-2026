@@ -6,6 +6,7 @@
 //! its rarest term by reading the text around them. Memory is bounded by the chunk, not the corpus.
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
@@ -14,6 +15,8 @@ use std::{env, ptr, slice, thread};
 const CHUNK_BYTES: usize = 1 << 20;
 const REL_BITS: u32 = 14; // A chunk of 4 MB holds about 4,000 documents; asserted to fit in 16,384.
 const SAMPLE_BYTES: usize = 1 << 18;
+const READ_BYTES: usize = 1 << 18;
+const PAD: usize = 128;
 const NONE: u32 = u32::MAX;
 
 const PROT_READ: i32 = 1;
@@ -326,7 +329,7 @@ fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
 struct Worker {
     last_doc: Vec<u16>,
     log: Vec<u32>,
-    anchors: Vec<(u32, u32, *const u8)>,
+    buffer: Vec<u8>,
     counts: Vec<u32>,
     list: Vec<u16>,
     dense_of: Vec<u32>,
@@ -361,7 +364,7 @@ impl Worker {
         Worker {
             last_doc: vec![0; plan.bool_terms],
             log: Vec::new(),
-            anchors: Vec::new(),
+            buffer: vec![0; READ_BYTES + 2 * PAD],
             counts: vec![0; plan.bool_terms + 1],
             list: Vec::new(),
             dense_of: vec![NONE; plan.bool_terms],
@@ -374,50 +377,71 @@ impl Worker {
         }
     }
 
-    /// Tokenises input[start..end] and returns the base document id and the document count.
-    fn scan(&mut self, input: &[u8], start: usize, end: usize, shared: &Shared) -> (u32, usize) {
+    /// Tokenises the file range [start, end) of whole documents and returns the base document id and
+    /// the document count. The bytes are read in pieces that stay in this core's L2. Phrases are
+    /// verified on the spot, while the text around the occurrence is still in the buffer.
+    fn scan(&mut self, file: &File, start: usize, end: usize, shared: &Shared) -> (u32, usize) {
         let Shared { q, plan, .. } = shared;
         self.log.clear();
-        self.anchors.clear();
         self.last_doc.fill(0);
         let mut base = 0;
         let mut docs = 0usize;
-        unsafe {
-            let mut p = input.as_ptr().add(start);
-            let stop = input.as_ptr().add(end);
-            while p < stop {
-                let mut id = 0u32;
-                while *p != b'\t' {
-                    id = id * 10 + (*p - b'0') as u32;
-                    p = p.add(1);
-                }
-                if docs == 0 {
-                    base = id;
-                }
-                docs += 1;
-                let rel = (id - base) as u32;
-                assert!(rel >> REL_BITS == 0);
-                let (log, anchors, last_doc) = (&mut self.log, &mut self.anchors, &mut self.last_doc);
-                p = for_each_token(p.add(1), |a, b| {
-                    let term = q.terms.find(a, b as usize - a as usize);
-                    if term == NONE {
-                        return;
+        let mut position = start;
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let capacity = buffer.len() - 2 * PAD;
+        while position < end {
+            let wanted = capacity.min(end - position);
+            // A LF in front means reading backwards from the first document's text stops in time.
+            buffer[PAD - 1] = b'\n';
+            file.read_exact_at(&mut buffer[PAD..PAD + wanted], position as u64).unwrap();
+            let whole = buffer[PAD..PAD + wanted].iter().rposition(|&b| b == b'\n').unwrap() + 1;
+            unsafe {
+                let mut p = buffer.as_ptr().add(PAD);
+                let stop = p.add(whole);
+                while p < stop {
+                    let mut id = 0u32;
+                    while *p != b'\t' {
+                        id = id * 10 + (*p - b'0') as u32;
+                        p = p.add(1);
                     }
-                    let role = *plan.role.get_unchecked(term as usize);
-                    if role & BOOL_TERM != 0 {
-                        let index = role & !(BOOL_TERM | ANCHOR_TERM);
-                        let last = last_doc.get_unchecked_mut(index as usize);
-                        if *last != rel as u16 + 1 {
-                            *last = rel as u16 + 1;
-                            log.push(index << REL_BITS | rel);
+                    if docs == 0 {
+                        base = id;
+                    }
+                    docs += 1;
+                    let rel = id - base;
+                    assert!(rel >> REL_BITS == 0);
+                    let (log, last_doc, last_hit, hits) = (&mut self.log, &mut self.last_doc, &mut self.last_hit, &mut self.hits);
+                    p = for_each_token(p.add(1), |a, b| {
+                        let term = q.terms.find(a, b as usize - a as usize);
+                        if term == NONE {
+                            return;
                         }
-                    }
-                    if role & ANCHOR_TERM != 0 {
-                        anchors.push((term, rel, a));
-                    }
-                });
+                        let role = *plan.role.get_unchecked(term as usize);
+                        if role & BOOL_TERM != 0 {
+                            let index = role & !(BOOL_TERM | ANCHOR_TERM);
+                            let last = last_doc.get_unchecked_mut(index as usize);
+                            if *last != rel as u16 + 1 {
+                                *last = rel as u16 + 1;
+                                log.push(index << REL_BITS | rel);
+                            }
+                        }
+                        if role & ANCHOR_TERM != 0 {
+                            let from = plan.anchored_at[term as usize] as usize;
+                            let to = plan.anchored_at[term as usize + 1] as usize;
+                            for &index in &plan.anchored[from..to] {
+                                let phrase = &q.phrases[index as usize];
+                                if last_hit[index as usize] != id && phrase_at(q, phrase, a) {
+                                    last_hit[index as usize] = id;
+                                    hits.push((phrase.query, id));
+                                }
+                            }
+                        }
+                    });
+                }
             }
+            position += whole;
         }
+        self.buffer = buffer;
         (base, docs)
     }
 
@@ -544,23 +568,6 @@ impl Worker {
             }
         }
     }
-
-    /// Checks each phrase anchored at each occurrence seen in this chunk.
-    fn answer_phrases(&mut self, base: u32, shared: &Shared) {
-        let Shared { q, plan, .. } = shared;
-        for &(term, rel, at) in &self.anchors {
-            let from = plan.anchored_at[term as usize] as usize;
-            let to = plan.anchored_at[term as usize + 1] as usize;
-            for &index in &plan.anchored[from..to] {
-                let phrase = &q.phrases[index as usize];
-                let doc = base + rel;
-                if self.last_hit[index as usize] != doc && unsafe { phrase_at(q, phrase, at) } {
-                    self.last_hit[index as usize] = doc;
-                    self.hits.push((phrase.query, doc));
-                }
-            }
-        }
-    }
 }
 
 /// Whether the phrase is in the text with its anchor term at `at`, reading outward from there.
@@ -640,6 +647,7 @@ fn main() {
     }
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
+    let file = File::open(format!("{data}/docs.txt")).unwrap();
     let input = map_file(format!("{data}/docs.txt"));
     let mut q = parse_queries(map_file(format!("{data}/queries.txt")));
     let sample_end = doc_start(input, SAMPLE_BYTES);
@@ -668,13 +676,12 @@ fn main() {
                             return std::mem::take(&mut worker.hits);
                         }
                         let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
-                        let (base, docs) = worker.scan(input, from, to, &shared);
+                        let (base, docs) = worker.scan(&file, from, to, &shared);
                         let words = docs.div_ceil(64).max(1);
                         worker.invert(words);
                         let mut slot = firsts[i].lock().unwrap();
                         slot.base = base;
                         worker.answer_bools(base, words, &shared, &mut slot.entries);
-                        worker.answer_phrases(base, &shared);
                     }
                 })
             })

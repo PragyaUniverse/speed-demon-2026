@@ -7,6 +7,7 @@
 //! searches touch little memory and 12 threads do not need 12 arrays of 1.7M distances.
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
@@ -313,7 +314,7 @@ struct Graph {
 }
 
 impl Graph {
-    fn parse(input: &'static [u8]) -> (Vec<u32>, Graph) {
+    fn parse(input: &'static [u8], file: &File) -> (Vec<u32>, Graph) {
         let mut p = input.as_ptr();
         let (n, m);
         unsafe {
@@ -326,7 +327,8 @@ impl Graph {
         let start = p as usize - input.as_ptr() as usize;
 
         // Workers claim newline-aligned chunks and spill forward edges into per-partition buckets.
-        const CHUNK: usize = 1 << 20;
+        // Each chunk is read into a buffer that stays in this core's L2 while it is parsed.
+        const CHUNK: usize = 1 << 18;
         let claim = AtomicUsize::new(0);
         let line_start = |at: usize| {
             if at <= start {
@@ -344,6 +346,7 @@ impl Graph {
                         let share = m / PARTITIONS / workers() * 5 / 4;
                         let mut buckets: Buckets = (0..PARTITIONS).map(|_| Vec::with_capacity(share)).collect();
                         let mut local_heavy = Vec::new();
+                        let mut buffer = vec![0u8; CHUNK + 256];
                         loop {
                             let i = claim.fetch_add(1, Relaxed);
                             let (from, to) = (start + i * CHUNK, start + (i + 1) * CHUNK);
@@ -351,8 +354,10 @@ impl Graph {
                                 heavy.lock().unwrap().extend_from_slice(&local_heavy);
                                 return buckets;
                             }
-                            let mut q = input.as_ptr().add(line_start(from));
-                            let stop = input.as_ptr().add(line_start(to));
+                            let (first, last) = (line_start(from), line_start(to));
+                            file.read_exact_at(&mut buffer[..last - first], first as u64).unwrap();
+                            let mut q = buffer.as_ptr();
+                            let stop = q.add(last - first);
                             while q < stop {
                                 let (u, r) = number(q);
                                 let (v, r) = number(r);
@@ -599,7 +604,8 @@ impl<D: Distance> Search<D> {
 fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
-    let (rank, graph) = Graph::parse(map_file(format!("{data}/graph.txt")));
+    let file = File::open(format!("{data}/graph.txt")).unwrap();
+    let (rank, graph) = Graph::parse(map_file(format!("{data}/graph.txt")), &file);
     let text = std::fs::read(format!("{data}/queries.txt")).unwrap();
     let mut queries = Vec::new();
     let mut fields = text.split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty()).map(|f| {
