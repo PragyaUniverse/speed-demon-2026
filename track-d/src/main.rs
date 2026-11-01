@@ -35,6 +35,8 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    #[cfg(target_os = "linux")]
+    fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
 }
 
 /// Maps a file with one zeroed page behind it, so word reads may run past the end of the data.
@@ -60,6 +62,18 @@ fn huge_u32s(n: usize) -> &'static mut [u32] {
         madvise(base, bytes, MADV_HUGEPAGE);
         slice::from_raw_parts_mut(base as *mut u32, n)
     }
+}
+
+/// Asks for a cache line ahead of use, so the miss overlaps with other work instead of stalling it.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
 }
 
 /// Parses the decimal number at `p` (ended by a space or LF); returns it and the byte after the end.
@@ -247,12 +261,16 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
                             order.push(x as u32);
                             let mut at = blob;
                             while at < order.len() {
+                                if let Some(&next) = order.get(at + 1) {
+                                    prefetch(unsafe { old.edges.as_ptr().add(old.offsets[next as usize] as usize) });
+                                }
                                 let edges = old.adjacent(order[at]);
                                 edge_count += edges.len();
                                 for &e in edges {
                                     let v = (e >> WEIGHT_BITS) as usize;
                                     if order.len() - blob < BLOB && claim(v) {
                                         order.push(v as u32);
+                                        prefetch(unsafe { old.offsets.as_ptr().add(v) });
                                     }
                                 }
                                 at += 1;
@@ -292,6 +310,18 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
                 let (off, out) = (off_at as *mut u32, out_at as *mut u32);
                 let mut pos = eb;
                 for (i, &x) in order.iter().enumerate() {
+                    // Three misses per node, each resolved a few nodes ahead of the one before it.
+                    if let Some(&far) = order.get(i + 12) {
+                        prefetch(old.offsets.as_ptr().add(far as usize));
+                    }
+                    if let Some(&mid) = order.get(i + 6) {
+                        prefetch(old.edges.as_ptr().add(old.offsets[mid as usize] as usize));
+                    }
+                    if let Some(&near) = order.get(i + 2) {
+                        for &e in old.adjacent(near) {
+                            prefetch(rank.as_ptr().add((e >> WEIGHT_BITS) as usize));
+                        }
+                    }
                     *off.add(nb + i) = pos as u32;
                     for &e in old.adjacent(x) {
                         let head = *rank.get_unchecked((e >> WEIGHT_BITS) as usize);
@@ -602,6 +632,12 @@ impl<D: Distance> Search<D> {
 }
 
 fn main() {
+    // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const PR_SET_THP_DISABLE: i32 = 41;
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/graph.txt")).unwrap();
