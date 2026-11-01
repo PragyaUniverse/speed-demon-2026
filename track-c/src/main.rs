@@ -373,12 +373,10 @@ fn main() {
         const PR_SET_THP_DISABLE: i32 = 41;
         prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
-    diag("start");
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/records.csv"));
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
-    diag("regions");
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let count = codes.len();
     let stride = count.next_multiple_of(8);
@@ -430,7 +428,6 @@ fn main() {
         }
     });
 
-    diag("parsed");
     let rows = (shared.next_name.load(Relaxed) as usize >> 6) + 1;
     let mut lines = BTreeMap::new();
     for (group, t) in totals.iter().enumerate().filter(|(_, t)| t.count > 0) {
@@ -451,23 +448,5 @@ fn main() {
     let mut output = File::create(format!("{out}/aggregates.txt")).unwrap();
     output.write_all(lines.into_values().collect::<String>().as_bytes()).unwrap();
     // Skip unmapping and destructors: the process is done and the clock is running.
-    diag("end");
-    diag_env();
     std::process::exit(0);
-}
-
-fn diag(label: &str) {
-    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let t = T0.get_or_init(std::time::Instant::now).elapsed();
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let flt = stat.rsplit(')').next().unwrap_or("").split(' ').nth(8).unwrap_or("").to_string();
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let pick = |k: &str| status.lines().find(|l| l.starts_with(k)).unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
-    eprintln!("{label} {:.2}ms flt={flt} anon={} hwm={}", t.as_secs_f64() * 1e3, pick("RssAnon"), pick("VmHWM"));
-}
-fn diag_env() {
-    for f in ["/sys/kernel/mm/transparent_hugepage/enabled", "/proc/version", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"] {
-        eprintln!("{f}: {}", std::fs::read_to_string(f).unwrap_or_default().trim());
-    }
-    std::process::exit(3);
 }
