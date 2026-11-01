@@ -35,3 +35,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | ccb00ab | 4 MB chunks | run-3cf7b65c4c78 | 293 | 53.7 | Second sample run-0d2ae9bc44aa 277. Evaluating half as often gained nothing, and memory passed the 44 MB cap. **Reverted** |
 | e2ffea4 | 6 threads instead of 12 | run-48796a83469c | 404 | 28.1 | 1.4x from the second hyperthreads, a healthy figure. So parallelism is not the gap. **Reverted** |
 | 013f9b2 | Pin each worker to one logical CPU | run-553e0fa6b0e6 | 282 | 45.4 | Second sample run-c2859691d034 284. **No gain for 14 lines, reverted** |
+| 92a5a47 | PROBE: exit code reports the features the build enabled | ID not captured | 0.4 | 7.5 | Exit code 31: AVX2, BMI2 and static linking are all on, so the gap to the leaders is not a build mistake. Also the true memory floor of a program that does nothing, about 7.5 MB |

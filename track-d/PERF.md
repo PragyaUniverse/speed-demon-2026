@@ -37,3 +37,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
 | d271ae5 | PROBE: spawn 12 threads and exit | run-8c55780453ed | 0.9 | 7.8 | Thread start-up is not the problem |
+| 92a5a47 | PROBE: exit code reports the features the build enabled | ID not captured | 0.4 | 7.5 | Exit code 31: AVX2, BMI2 and static linking are all on, so the gap to the leaders is not a build mistake. Also the true memory floor of a program that does nothing, about 7.5 MB |

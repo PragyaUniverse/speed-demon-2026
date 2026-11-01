@@ -37,3 +37,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | b9545ea | 64-byte space search, 72 segments | run-52444b3e7a49 | 27.8 | 23.9 | Second sample run-50a18a40c017 28.3. **No gain, reverted** |
 | d271ae5 | PROBE: exit at once | run-082e17bc0271 | 0.4 | 8.1 | A program that does nothing peaks at 8 MB, so memory has a floor well above the 4.6 MB that would earn the full factor |
 | 2a02156 | Constant-cost name compare instead of `memcmp` per line | run-949d4b8a810c | 29.3 | 22.8 | Second sample run-8a5b04af0509 27.4. Local count: parsing 254 instructions per line, output about 100. **No gain for 20 lines, reverted** |
+| 92a5a47 | PROBE: exit code reports the features the build enabled | ID not captured | 0.4 | 7.5 | Exit code 31: AVX2, BMI2 and static linking are all on, so the gap to the leaders is not a build mistake. Also the true memory floor of a program that does nothing, about 7.5 MB |
