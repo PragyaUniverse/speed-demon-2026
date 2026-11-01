@@ -566,6 +566,8 @@ impl<D: Distance> Search<D> {
 }
 
 fn main() {
+    let code = cfg!(target_feature = "avx2") as i32 + 2 * cfg!(target_feature = "crt-static") as i32 + 4 * cfg!(target_feature = "bmi2") as i32 + 8 * cfg!(target_arch = "x86_64") as i32; // PROBE
+    std::process::exit(16 + code); // PROBE
     // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
     #[cfg(target_os = "linux")]
     unsafe {
