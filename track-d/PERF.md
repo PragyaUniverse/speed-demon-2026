@@ -30,3 +30,7 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | d5361fb | Buffered reads | run-a4590b3b0db3 | 164 | 96.0 | Small gain, kept |
 | 4b279b1 | PGO on generator output | run-446f11693771 | 178 | 96.6 | Two more samples: run-47c9fd906cf5 181, run-30cb387eec28 211. **Worse, removed** |
 | a9e9fc9 | No Track D change, PGO removed | run-80d20711687f | 171 | 92.5 | |
+| 82ac983 | Huge pages off; prefetching in relabel | run-624b22c47b65 | 167 | 84.8 | Memory down 12 MB at the same time, which also settles step 2: huge pages did not earn their memory here. Prefetching gave nothing visible for 34 lines. **Prefetching reverted** |
+| 58784c5 | PROBE: exit code reports system CPU ticks, with huge pages off | commit 58784c5, ID not captured | 165 | 87.4 | Exit code 19: about 190 ms of CPU in the kernel |
+| de12444 | Remove mapping and huge page code | run-2e1dc2514d60 | 163 | 82.9 | S 651 to 594 for the same work |
+| b6d9209 | Do not queue a node that cannot beat the best path | run-b5409bb3a712 | 167 | 83.7 | 8% faster in the VM (94 to 87 ms), within noise on the box. Kept, since it costs 3 lines |

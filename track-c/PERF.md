@@ -25,3 +25,6 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | d5361fb | Buffered reads, as in Track A | run-8b22f8aa0451 | 40.4 | 13.5 | About 1 ms for 3 MB more: a net loss on K. **Reverted** |
 | 4b279b1 | PGO on generator output | run-3bfbd10e33df | 51.0 | 11.7 | Two more samples: run-7f8fceeab9e9 46.4, run-001cdb519679 42.2. **No gain, removed** |
 | a9e9fc9 | No Track C change, PGO removed | run-c3a338b69070 | 41.2 | 10.0 | Same as before PGO |
+| 82ac983 | Prefetch ring in front of the name table | run-79fb8c5eb986 | 41.3 | 10.5 | **No gain for 35 lines, reverted.** So the 13 ms of name tracking is not mainly the table's misses |
+| 58784c5 | PROBE: exit code reports user CPU ticks | commit 58784c5, ID not captured | 41.4 | 10.3 | Exit code 37: about 370 ms of CPU, or 9 of 12 threads busy throughout. Parallelism is fine; the cost is per record |
+| b6d9209 | Name batches of 512 | run-802e178c7c4b | 40.5 | 11.6 | About 1 ms for 1.4 MB. **Reverted** |

@@ -28,3 +28,7 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | b0c32a5 | Read into 256 KB buffers instead of parsing the mapping | run-15d0f94e3870 | 27.8 | 23.4 | **Kept.** No page faults or unmapping, and the bytes are in L2 when parsed. Later runs of this code: run-e5e4a15297d6 28.4, run-906cc5a3cb21 29.0, run-15876c3b1558 27.8 |
 | 80c0536 | No Track A change | run-a8c1f20a6405 | 71.7 | 22.8 | A second outlier on identical code, so the first track of a batch is sometimes hit |
 | 4b279b1 | PGO on generator output | run-94e554564b29 | 30.1 | 22.9 | Two more samples: run-2ee4e4c88ee5 28.1, run-f497a41776f6 29.0. **No gain over 28, removed** |
+| 82ac983 | Output through a shared mapping, retried on the box | run-cc47fdbb8a0e | 77.4 | 22.9 | **Slower, reverted.** S 483. The VM's result in step 4 was right |
+| 58784c5 | PROBE: exit code reports the thread count | commit 58784c5, ID not captured | 34.1 | 23.8 | Exit code 12: all threads present, so parallelism is not the gap to the leaders |
+| de12444 | Remove the mapping entirely; endpoint names are small heap copies | run-a52f07941687 | 32.7 | 23.4 | S 459 to 439 for the same work |
+| b6d9209 | 128 KB reads | run-299c5c6d3e3f | 66.6 | 22.9 | An outlier, and only 0.5 MB saved. **Reverted** |

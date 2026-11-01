@@ -226,7 +226,7 @@ impl Shared {
 
 }
 
-const BATCH: usize = 512;
+const BATCH: usize = 128;
 
 /// One worker's aggregates, plus its (name id, group) pairs on their way to the lines' owners.
 struct Worker {

@@ -25,3 +25,7 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 80c0536 | 1 MB term table, 2 MB chunks | run-b23c2e23102c | 319 | 44.1 | Better, and the smaller table pays for the larger chunks' memory |
 | 4b279b1 | PGO on generator output, seed 2 sample | run-9913070bddc2 | 295 | 44.3 | Two more samples: run-474e8ac31656 313, run-4238f68a2125 293. **Kept on this track only** |
 | a9e9fc9 | Evaluate only queries a present term can lift | run-eb4f16d76d8b | 293 | 44.3 | **No gain for 39 lines, reverted** |
+| 82ac983 | Thread-local tallies instead of shared counters | run-60a7c2f80644 | 305 | 47.8 | **No gain, more memory, reverted** |
+| 58784c5 | PROBE: exit code reports system CPU ticks | commit 58784c5, ID not captured | 295 | 44.5 | Exit code 9: about 90 ms of CPU in the kernel, out of several seconds. The time is my own code |
+| 515f426 | Frequent terms write bitsets directly during the scan, skipping log and dedupe | run-9369b10f8c79 | 279 | 43.1 | **Kept.** New best on this track |
+| de12444 | Remove the mapping entirely | run-87256012fabc | 281 | 45.4 | S 772 to 739 for the same work |
