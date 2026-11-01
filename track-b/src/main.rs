@@ -13,11 +13,14 @@ use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const CHUNK_BYTES: usize = 1 << 21;
-const REL_BITS: u32 = 14; // A chunk of 4 MB holds about 4,000 documents; asserted to fit in 16,384.
+const REL_BITS: u32 = 12; // A 2 MB chunk holds about 2,000 documents; asserted to fit in 4,096.
 const SAMPLE_BYTES: usize = 1 << 18;
 const READ_BYTES: usize = 1 << 18;
 const PAD: usize = 128;
 const NONE: u32 = u32::MAX;
+// A term this common in the sample skips the log: its bitset is written directly during the scan.
+const FREQUENT: u32 = 8;
+const STRIDE: usize = 1 << (REL_BITS - 6); // Words per bitset row, enough for any chunk.
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -288,6 +291,8 @@ struct Plan {
     /// Per term: flags and its dense index among the BOOL terms.
     role: Vec<u32>,
     bool_terms: usize,
+    /// BOOL terms below this index are the frequent ones, and their index is their bitset row.
+    frequent: usize,
     /// Per term: range in `anchored` of the phrases anchored on it.
     anchored_at: Vec<u32>,
     anchored: Vec<u32>,
@@ -296,14 +301,22 @@ struct Plan {
 fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
     let n = q.terms.text.len();
     let mut role = vec![0u32; n];
+    let mut frequent = 0;
     let mut bool_terms = 0;
-    for op in &mut q.bool_ops {
-        let term = op.1 as usize;
-        if role[term] == 0 {
-            role[term] = BOOL_TERM | bool_terms;
-            bool_terms += 1;
+    for pass in [true, false] {
+        for op in &q.bool_ops {
+            let term = op.1 as usize;
+            if role[term] == 0 && (frequency[term] >= FREQUENT) == pass {
+                role[term] = BOOL_TERM | bool_terms;
+                bool_terms += 1;
+            }
         }
-        op.1 = role[term] & !(BOOL_TERM | ANCHOR_TERM);
+        if pass {
+            frequent = bool_terms as usize;
+        }
+    }
+    for op in &mut q.bool_ops {
+        op.1 = role[op.1 as usize] & !(BOOL_TERM | ANCHOR_TERM);
     }
     let text = &q.terms.text;
     let mut counts = vec![0u32; n + 1];
@@ -325,7 +338,7 @@ fn make_plan(q: &mut Queries, frequency: &[u32]) -> Plan {
         anchored[cursor[anchor] as usize] = i as u32;
         cursor[anchor] += 1;
     }
-    Plan { role, bool_terms: bool_terms as usize, anchored_at: counts, anchored }
+    Plan { role, frequent, bool_terms: bool_terms as usize, anchored_at: counts, anchored }
 }
 
 /// One worker's reusable buffers.
@@ -387,6 +400,8 @@ impl Worker {
         let Shared { q, plan, .. } = shared;
         self.log.clear();
         self.last_doc.fill(0);
+        self.dense.clear();
+        self.dense.resize(plan.frequent * STRIDE, 0);
         let mut base = 0;
         let mut docs = 0usize;
         let mut position = start;
@@ -413,7 +428,8 @@ impl Worker {
                     docs += 1;
                     let rel = id - base;
                     assert!(rel >> REL_BITS == 0);
-                    let (log, last_doc, last_hit, hits) = (&mut self.log, &mut self.last_doc, &mut self.last_hit, &mut self.hits);
+                    let (log, last_doc, last_hit, hits, dense) =
+                        (&mut self.log, &mut self.last_doc, &mut self.last_hit, &mut self.hits, &mut self.dense);
                     p = for_each_token(p.add(1), |a, b| {
                         let term = q.terms.find(a, b as usize - a as usize);
                         if term == NONE {
@@ -422,10 +438,14 @@ impl Worker {
                         let role = *plan.role.get_unchecked(term as usize);
                         if role & BOOL_TERM != 0 {
                             let index = role & !(BOOL_TERM | ANCHOR_TERM);
-                            let last = last_doc.get_unchecked_mut(index as usize);
-                            if *last != rel as u16 + 1 {
-                                *last = rel as u16 + 1;
-                                log.push(index << REL_BITS | rel);
+                            if (index as usize) < plan.frequent {
+                                *dense.get_unchecked_mut(index as usize * STRIDE + (rel as usize >> 6)) |= 1 << (rel & 63);
+                            } else {
+                                let last = last_doc.get_unchecked_mut(index as usize);
+                                if *last != rel as u16 + 1 {
+                                    *last = rel as u16 + 1;
+                                    log.push(index << REL_BITS | rel);
+                                }
                             }
                         }
                         if role & ANCHOR_TERM != 0 {
@@ -450,19 +470,20 @@ impl Worker {
 
     /// Groups the log by term: each term's documents become a sorted u16 list, or a bitset if it
     /// has enough of them that word-at-a-time operations win.
-    fn invert(&mut self, words: usize) {
+    fn invert(&mut self, words: usize, frequent: usize) {
         self.counts.fill(0);
         for &entry in &self.log {
             self.counts[(entry >> REL_BITS) as usize + 1] += 1;
         }
-        self.dense.clear();
         let mut total = 0;
         for t in 0..self.dense_of.len() {
             let count = self.counts[t + 1];
             self.dense_of[t] = NONE;
-            if count as usize >= words {
-                self.dense_of[t] = (self.dense.len() / words) as u32;
-                self.dense.resize(self.dense.len() + words, 0);
+            if t < frequent {
+                self.dense_of[t] = t as u32;
+            } else if count as usize >= words {
+                self.dense_of[t] = (self.dense.len() / STRIDE) as u32;
+                self.dense.resize(self.dense.len() + STRIDE, 0);
             }
             self.counts[t + 1] = total;
             total += count;
@@ -473,7 +494,7 @@ impl Worker {
             let rel = (entry & ((1 << REL_BITS) - 1)) as u16;
             let at = self.dense_of[t];
             if at != NONE {
-                set_bit(&mut self.dense[at as usize * words..][..words], rel);
+                set_bit(&mut self.dense[at as usize * STRIDE..][..words], rel);
             }
             self.list[self.counts[t + 1] as usize] = rel;
             self.counts[t + 1] += 1;
@@ -491,16 +512,16 @@ impl Worker {
             match op {
                 Op::Or => {
                     if at != NONE {
-                        let bits = &self.dense[at as usize * words..][..words];
+                        let bits = &self.dense[at as usize * STRIDE..][..words];
                         self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r |= b);
                     } else {
                         docs.iter().for_each(|&d| set_bit(&mut self.result, d));
                     }
-                    any |= !docs.is_empty();
+                    any |= at != NONE || !docs.is_empty();
                 }
                 Op::And if any => {
                     if at != NONE {
-                        let bits = &self.dense[at as usize * words..][..words];
+                        let bits = &self.dense[at as usize * STRIDE..][..words];
                         self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r &= b);
                     } else {
                         self.scratch[..words].fill(0);
@@ -512,9 +533,9 @@ impl Worker {
                         std::mem::swap(&mut self.result, &mut self.scratch);
                     }
                 }
-                Op::Not if any && !docs.is_empty() => {
+                Op::Not if any && (at != NONE || !docs.is_empty()) => {
                     if at != NONE {
-                        let bits = &self.dense[at as usize * words..][..words];
+                        let bits = &self.dense[at as usize * STRIDE..][..words];
                         self.result[..words].iter_mut().zip(bits).for_each(|(r, b)| *r &= !b);
                     } else {
                         for &d in docs {
@@ -681,7 +702,7 @@ fn main() {
                         let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
                         let (base, docs) = worker.scan(&file, from, to, &shared);
                         let words = docs.div_ceil(64).max(1);
-                        worker.invert(words);
+                        worker.invert(words, plan.frequent);
                         let mut slot = firsts[i].lock().unwrap();
                         slot.base = base;
                         worker.answer_bools(base, words, &shared, &mut slot.entries);
