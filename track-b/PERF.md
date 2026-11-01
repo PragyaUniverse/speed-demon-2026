@@ -29,3 +29,5 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 58784c5 | PROBE: exit code reports system CPU ticks | commit 58784c5, ID not captured | 295 | 44.5 | Exit code 9: about 90 ms of CPU in the kernel, out of several seconds. The time is my own code |
 | 515f426 | Frequent terms write bitsets directly during the scan, skipping log and dedupe | run-9369b10f8c79 | 279 | 43.1 | **Kept.** New best on this track |
 | de12444 | Remove the mapping entirely | run-87256012fabc | 281 | 45.4 | S 772 to 739 for the same work |
+| 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
+| 58784c5 and later | Later probes for this track are in the rows above | | | | |

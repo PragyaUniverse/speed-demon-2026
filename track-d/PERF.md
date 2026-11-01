@@ -34,3 +34,5 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 58784c5 | PROBE: exit code reports system CPU ticks, with huge pages off | commit 58784c5, ID not captured | 165 | 87.4 | Exit code 19: about 190 ms of CPU in the kernel |
 | de12444 | Remove mapping and huge page code | run-2e1dc2514d60 | 163 | 82.9 | S 651 to 594 for the same work |
 | b6d9209 | Do not queue a node that cannot beat the best path | run-b5409bb3a712 | 167 | 83.7 | 8% faster in the VM (94 to 87 ms), within noise on the box. Kept, since it costs 3 lines |
+| 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
+| 58784c5 and later | Later probes for this track are in the rows above | | | | |

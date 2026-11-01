@@ -32,3 +32,5 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 58784c5 | PROBE: exit code reports the thread count | commit 58784c5, ID not captured | 34.1 | 23.8 | Exit code 12: all threads present, so parallelism is not the gap to the leaders |
 | de12444 | Remove the mapping entirely; endpoint names are small heap copies | run-a52f07941687 | 32.7 | 23.4 | S 459 to 439 for the same work |
 | b6d9209 | 128 KB reads | run-299c5c6d3e3f | 66.6 | 22.9 | An outlier, and only 0.5 MB saved. **Reverted** |
+| 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
+| 58784c5 and later | Later probes for this track are in the rows above | | | | |

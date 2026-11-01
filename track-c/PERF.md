@@ -28,3 +28,5 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 82ac983 | Prefetch ring in front of the name table | run-79fb8c5eb986 | 41.3 | 10.5 | **No gain for 35 lines, reverted.** So the 13 ms of name tracking is not mainly the table's misses |
 | 58784c5 | PROBE: exit code reports user CPU ticks | commit 58784c5, ID not captured | 41.4 | 10.3 | Exit code 37: about 370 ms of CPU, or 9 of 12 threads busy throughout. Parallelism is fine; the cost is per record |
 | b6d9209 | Name batches of 512 | run-802e178c7c4b | 40.5 | 11.6 | About 1 ms for 1.4 MB. **Reverted** |
+| 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
+| 58784c5 and later | Later probes for this track are in the rows above | | | | |
