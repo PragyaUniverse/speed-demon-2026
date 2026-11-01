@@ -95,20 +95,24 @@ unsafe fn number_field(p: *const u8) -> (u64, *const u8) {
     (digits8(word << (64 - 8 * k)), p.add(k + 1))
 }
 
-/// Distance to the next `b`, which is known to exist.
+/// Distance to the next `b`, which is known to exist. Scanning 64 bytes at once means the length of
+/// a name or note almost never decides a branch, which is what a 32-byte loop would mispredict on.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
 unsafe fn until(p: *const u8, b: u8) -> usize {
     use std::arch::x86_64::*;
     let needle = _mm256_set1_epi8(b as i8);
+    let mask = |q: *const u8| {
+        let v = _mm256_loadu_si256(q as *const __m256i);
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32 as u64
+    };
     let mut n = 0;
     loop {
-        let v = _mm256_loadu_si256(p.add(n) as *const __m256i);
-        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;
+        let m = mask(p.add(n)) | mask(p.add(n + 32)) << 32;
         if m != 0 {
             return n + m.trailing_zeros() as usize;
         }
-        n += 32;
+        n += 64;
     }
 }
 
@@ -147,20 +151,20 @@ unsafe fn text_field(p: *const u8) -> (*const u8, usize, usize, *const u8) {
     (start, raw, raw - escapes, q.add(2))
 }
 
-/// Multiply-mix over all bytes of the name, with a masked load so that nothing past it counts.
+/// Hash of all bytes of a name. Up to 16 bytes, which is most names, two overlapping masked words
+/// cover them with no loop, so a name's length does not decide a branch.
 #[inline(always)]
 unsafe fn hash_name(p: *const u8, len: usize) -> u64 {
     const K: u64 = 0x9E3779B97F4A7C15;
-    let mut h = (len as u64).wrapping_mul(K);
-    let mut i = 0;
+    let head = load(p) & (u64::MAX >> (64 - 8 * len.min(8)) >> ((len == 0) as u32 * 63) >> (len == 0) as u32);
+    let tail = load(p.add(len.max(8) - 8)) & if len > 8 { u64::MAX } else { 0 };
+    let mut h = (head ^ tail.rotate_left(29).wrapping_mul(K)) ^ (len as u64).wrapping_mul(K);
+    let mut i = 8;
     while i + 8 < len {
         h = (h ^ load(p.add(i))).wrapping_mul(K).rotate_left(29);
         i += 8;
     }
-    if len > 0 {
-        let rest = len - i; // 1 to 8 bytes.
-        h = (h ^ (load(p.add(i)) & (u64::MAX >> (64 - 8 * rest)))).wrapping_mul(K);
-    }
+    h = h.wrapping_mul(K);
     h ^ (h >> 32)
 }
 
