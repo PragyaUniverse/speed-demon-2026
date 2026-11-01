@@ -95,6 +95,29 @@ unsafe fn until_space(p: *const u8) -> usize {
     }
 }
 
+/// Whether two names of the same length match. Up to 64 bytes this is a constant-cost compare with
+/// no call and no length-dependent branch, and it runs once per line.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn same_name(a: *const u8, b: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::*;
+    if len > 64 {
+        return slice::from_raw_parts(a, len) == slice::from_raw_parts(b, len);
+    }
+    let equal = |at: usize| {
+        let x = _mm256_loadu_si256(a.add(at) as *const __m256i);
+        let y = _mm256_loadu_si256(b.add(at) as *const __m256i);
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64
+    };
+    (equal(0) | equal(32) << 32 | (u64::MAX << 1 << (len - 1))) == u64::MAX
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn same_name(a: *const u8, b: *const u8, len: usize) -> bool {
+    slice::from_raw_parts(a, len) == slice::from_raw_parts(b, len)
+}
+
 /// Lock-free endpoint interner shared by all workers. After the first few thousand lines it is
 /// read-only, so its cache lines stay shared. A slot packs (address of a copy) << 8 | length.
 struct Interner {
@@ -122,14 +145,16 @@ impl Interner {
         loop {
             let packed = self.slots.get_unchecked(slot).load(Acquire);
             if packed == 0 {
-                let copy: &'static [u8] = Box::leak(key.to_vec().into_boxed_slice());
-                let new = (copy.as_ptr() as u64) << 8 | len as u64;
+                // Padded to 64 bytes, so that `same_name` may always load a full block.
+                let mut copy = key.to_vec();
+                copy.resize(len.max(64), 0);
+                let new = (copy.leak().as_ptr() as u64) << 8 | len as u64;
                 if self.slots[slot].compare_exchange(0, new, AcqRel, Acquire).is_ok() {
                     return slot;
                 }
                 continue; // Lost the race: re-read the slot, the winner may hold our key.
             }
-            if packed & 255 == len as u64 && self.name(slot) == key {
+            if packed & 255 == len as u64 && same_name((packed >> 8) as *const u8, p, len) {
                 return slot;
             }
             slot = (slot + 1) & (SLOTS - 1);
