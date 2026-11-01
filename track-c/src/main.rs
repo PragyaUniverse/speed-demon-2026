@@ -380,6 +380,11 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/records.csv"));
+    { // PROBE
+        let at = AtomicUsize::new(0); // PROBE
+        thread::scope(|sc| { for _ in 0..12 { sc.spawn(|| { let mut x = 0u64; loop { let o = at.fetch_add(1 << 18, Relaxed); if o >= input.len() { std::hint::black_box(x); return; } let e = (o + (1 << 18)).min(input.len()); let mut i = o; while i < e { x += input[i] as u64; i += 64; } } }); } }); // PROBE
+        std::process::exit(3); // PROBE
+    } // PROBE
     let (region_group, codes) = load_regions(map_file(format!("{data}/regions.csv")));
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let count = codes.len();

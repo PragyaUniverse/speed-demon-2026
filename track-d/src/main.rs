@@ -566,6 +566,7 @@ impl<D: Distance> Search<D> {
 }
 
 fn main() {
+    thread::scope(|sc| { for _ in 0..12 { sc.spawn(|| {}); } }); std::process::exit(3); // PROBE
     // Huge pages round every thread's small arena up to 2 MB, which the memory score sees.
     #[cfg(target_os = "linux")]
     unsafe {
