@@ -263,6 +263,7 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    diag("blobs");
     let rank_at = rank.as_mut_ptr() as usize;
     let offsets = huge_u32s(n + 1);
     let total: usize = orders.iter().map(|o| o.1).sum();
@@ -370,10 +371,13 @@ impl Graph {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        diag("parsed");
         let mut heavy: Vec<(u64, u32)> = heavy.into_inner().unwrap();
 
         let forward = Csr::build(n, shift, parts);
+        diag("fwd");
         let (rank, forward) = relabel(n, forward);
+        diag("relabel");
         for e in &mut heavy {
             let (u, v) = ((e.0 >> NODE_BITS) as usize, (e.0 & ((1 << NODE_BITS) - 1)) as usize);
             e.0 = (rank[u] as u64) << NODE_BITS | rank[v] as u64;
@@ -597,9 +601,11 @@ impl<D: Distance> Search<D> {
 }
 
 fn main() {
+    diag("start");
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let (rank, graph) = Graph::parse(map_file(format!("{data}/graph.txt")));
+    diag("bwd");
     let text = std::fs::read(format!("{data}/queries.txt")).unwrap();
     let mut queries = Vec::new();
     let mut fields = text.split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty()).map(|f| {
@@ -631,6 +637,7 @@ fn main() {
         }
     });
 
+    diag("queries");
     let mut lines = String::new();
     for a in &answers {
         match a.load(Relaxed) {
@@ -640,5 +647,23 @@ fn main() {
     }
     File::create(format!("{out}/distances.txt")).unwrap().write_all(lines.as_bytes()).unwrap();
     // Skip unmapping and destructors: the process is done and the clock is running.
+    diag("end");
+    diag_env();
     std::process::exit(0);
+}
+
+fn diag(label: &str) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = T0.get_or_init(std::time::Instant::now).elapsed();
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let flt = stat.rsplit(')').next().unwrap_or("").split(' ').nth(8).unwrap_or("").to_string();
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let pick = |k: &str| status.lines().find(|l| l.starts_with(k)).unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
+    eprintln!("{label} {:.2}ms flt={flt} anon={} hwm={}", t.as_secs_f64() * 1e3, pick("RssAnon"), pick("VmHWM"));
+}
+fn diag_env() {
+    for f in ["/sys/kernel/mm/transparent_hugepage/enabled", "/proc/version", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"] {
+        eprintln!("{f}: {}", std::fs::read_to_string(f).unwrap_or_default().trim());
+    }
+    std::process::exit(3);
 }

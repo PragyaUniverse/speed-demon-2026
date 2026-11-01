@@ -348,6 +348,7 @@ fn format_hour(bucket: usize, segments: &[Segment], order: &[(usize, &[u8])], s:
 }
 
 fn main() {
+    diag("start");
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/requests.log")).unwrap();
@@ -357,6 +358,7 @@ fn main() {
         return;
     }
     let input = map_input(&file, len);
+    diag("mapped");
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let names = Interner { slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect(), input };
 
@@ -383,11 +385,13 @@ fn main() {
     });
     let segments: Vec<Segment> = pending.into_iter().map(|m| m.into_inner().unwrap()).collect();
 
+    diag("parsed");
     // Bytewise order of the endpoints, shared by every hour.
     let mut order: Vec<(usize, &[u8])> =
         (0..SLOTS).map(|s| (s, names.name(s))).filter(|e| !e.1.is_empty()).collect();
     order.sort_unstable_by_key(|e| e.1);
 
+    diag("sorted");
     // offsets[h] is published once every earlier hour's length is known, which lets each worker
     // write its text at the right place while later hours are still being formatted.
     const UNKNOWN: u64 = u64::MAX;
@@ -417,6 +421,25 @@ fn main() {
             });
         }
     });
+    diag("formatted");
     // Skip unmapping and destructors: the process is done and the clock is running.
+    diag("end");
+    diag_env();
     std::process::exit(0);
+}
+
+fn diag(label: &str) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = T0.get_or_init(std::time::Instant::now).elapsed();
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let flt = stat.rsplit(')').next().unwrap_or("").split(' ').nth(8).unwrap_or("").to_string();
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let pick = |k: &str| status.lines().find(|l| l.starts_with(k)).unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
+    eprintln!("{label} {:.2}ms flt={flt} anon={} hwm={}", t.as_secs_f64() * 1e3, pick("RssAnon"), pick("VmHWM"));
+}
+fn diag_env() {
+    for f in ["/sys/kernel/mm/transparent_hugepage/enabled", "/proc/version", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"] {
+        eprintln!("{f}: {}", std::fs::read_to_string(f).unwrap_or_default().trim());
+    }
+    std::process::exit(3);
 }

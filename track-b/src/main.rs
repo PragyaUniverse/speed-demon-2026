@@ -629,15 +629,19 @@ fn push_number(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
+static PH: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 fn main() {
+    diag("start");
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let input = map_file(format!("{data}/docs.txt"));
     let mut q = parse_queries(map_file(format!("{data}/queries.txt")));
+    diag("queries_parsed");
     let sample_end = doc_start(input, SAMPLE_BYTES);
     let frequency = sample_frequencies(&q, &input[..sample_end]);
     let plan = make_plan(&mut q, &frequency);
 
+    diag("plan");
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
     let chunks = input.len().div_ceil(CHUNK_BYTES);
     let shared = Shared {
@@ -660,13 +664,18 @@ fn main() {
                             return std::mem::take(&mut worker.hits);
                         }
                         let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
+                        let t = std::time::Instant::now();
                         let (base, docs) = worker.scan(input, from, to, &shared);
+                        PH[0].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); let t = std::time::Instant::now();
                         let words = docs.div_ceil(64).max(1);
                         worker.invert(words);
+                        PH[1].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); let t = std::time::Instant::now();
                         let mut slot = firsts[i].lock().unwrap();
                         slot.base = base;
                         worker.answer_bools(base, words, &shared, &mut slot.entries);
+                        PH[2].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); let t = std::time::Instant::now();
                         worker.answer_phrases(base, &shared);
+                        PH[3].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
                     }
                 })
             })
@@ -674,6 +683,8 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    diag("chunks");
+    for (n, c) in ["scan", "invert", "bools", "phrases"].iter().zip(&PH) { eprintln!("cpu {n} {:.1}ms", c.load(Relaxed) as f64 / 1e6); }
     // Chunks in ascending order give each query its smallest ids first.
     let mut first_ten = vec![[0u32; 10]; q.total];
     let mut filled = vec![0u8; q.total];
@@ -704,6 +715,7 @@ fn main() {
             filled[query] += 1;
         }
     }
+    diag("merged");
     let mut text = Vec::with_capacity(q.total * 32);
     for query in 0..q.total {
         push_number(&mut text, counts[query]);
@@ -717,5 +729,23 @@ fn main() {
     }
     File::create(format!("{out}/results.txt")).unwrap().write_all(&text).unwrap();
     // Skip unmapping and destructors: the process is done and the clock is running.
+    diag("end");
+    diag_env();
     std::process::exit(0);
+}
+
+fn diag(label: &str) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = T0.get_or_init(std::time::Instant::now).elapsed();
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let flt = stat.rsplit(')').next().unwrap_or("").split(' ').nth(8).unwrap_or("").to_string();
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let pick = |k: &str| status.lines().find(|l| l.starts_with(k)).unwrap_or("").split_whitespace().nth(1).unwrap_or("").to_string();
+    eprintln!("{label} {:.2}ms flt={flt} anon={} hwm={}", t.as_secs_f64() * 1e3, pick("RssAnon"), pick("VmHWM"));
+}
+fn diag_env() {
+    for f in ["/sys/kernel/mm/transparent_hugepage/enabled", "/proc/version", "/sys/kernel/mm/transparent_hugepage/shmem_enabled"] {
+        eprintln!("{f}: {}", std::fs::read_to_string(f).unwrap_or_default().trim());
+    }
+    std::process::exit(3);
 }
