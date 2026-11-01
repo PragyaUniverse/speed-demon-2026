@@ -14,6 +14,8 @@ use std::{env, ptr, slice, thread};
 
 const HOURS: usize = 72;
 const SEGMENTS: usize = 24;
+const READ_BYTES: usize = 1 << 18;
+const PAD: usize = 64;
 const BLOCK: usize = 256; // Words per block; the first word links to the hour's previous block.
 const SLOT_BITS: u32 = 12;
 const SLOTS: usize = 1 << SLOT_BITS; // 1,842 endpoints per seed: the table stays under half full.
@@ -121,7 +123,7 @@ impl Interner {
     }
 
     #[inline(always)]
-    unsafe fn intern(&self, p: *const u8, len: usize) -> usize {
+    unsafe fn intern(&self, p: *const u8, len: usize, offset: usize) -> usize {
         // Sampling head, middle and tail keeps hashing O(1); equality is still byte-exact.
         let head = load(p) & (u64::MAX >> (64 - 8 * len.min(8)));
         let (mid, tail) = if len >= 8 { (load(p.add(len / 2 - 4)), load(p.add(len - 8))) } else { (0, 0) };
@@ -131,8 +133,7 @@ impl Interner {
         loop {
             let packed = self.slots.get_unchecked(slot).load(Acquire);
             if packed == 0 {
-                let off = p as usize - self.input.as_ptr() as usize;
-                let new = (off as u64 + 1) << 8 | len as u64;
+                let new = (offset as u64 + 1) << 8 | len as u64;
                 if self.slots[slot].compare_exchange(0, new, AcqRel, Acquire).is_ok() {
                     return slot;
                 }
@@ -201,43 +202,58 @@ impl Segment {
         *self.cursor.get_unchecked_mut(bucket) = at as u32 + 1;
     }
 
-    /// Parses every line of input[start..end]; both ends are line starts.
-    fn parse(&mut self, input: &[u8], start: usize, end: usize, names: &Interner) {
+    /// Parses every line of the file range [start, end); both ends are line starts. The bytes are
+    /// read into a buffer small enough to stay in this core's L2 while the lines are parsed.
+    fn parse(&mut self, file: &File, start: usize, end: usize, names: &Interner, buffer: &mut [u8]) {
         // Lines are at least 40 bytes and take at most 2 words: virtual space only, never touched.
         self.arena_bytes = (end - start) / 4 + (HOURS + 2) * BLOCK * 8;
         self.arena = reserve(self.arena_bytes) as *mut u32;
         self.next_block = BLOCK;
-        unsafe {
-            let mut p = input.as_ptr().add(start);
-            let stop = input.as_ptr().add(end);
-            while p < stop {
-                // "2026-10-30T18:..": the span is fixed, so the day's last digit plus whether the
-                // tens digit is '3' (October, bit 0 set) gives the day index directly.
-                let day = (*p.add(9) & 15) as usize + 1 - (*p.add(8) & 1) as usize;
-                let hour = (*p.add(11) & 15) as usize * 10 + (*p.add(12) & 15) as usize;
-                let bucket = day * 24 + hour - 18;
-                let endpoint = p.add(29 + first_byte(load(p.add(28)), b' '));
-                let len = until_space(endpoint);
-                let slot = names.intern(endpoint, len) as u32;
-                let status = endpoint.add(len + 1);
-                let error = ((*status == b'5') as u32) << LAT_BITS;
-                let (latency, digits) = parse_latency(status.add(4));
-                let tag = slot << (LAT_BITS + 1) | error;
-                if latency < SPILL {
-                    self.push(bucket, tag | latency);
-                } else {
-                    // A pair never straddles blocks: a marker in a block's last word is a filler.
-                    if self.cursor[bucket] as usize % BLOCK == BLOCK - 1 {
-                        self.push(bucket, SPILL);
-                    }
-                    self.push(bucket, tag | SPILL);
-                    self.push(bucket, latency);
-                }
-                p = status.add(5 + digits);
-            }
+        let capacity = buffer.len() - PAD;
+        let mut position = start;
+        while position < end {
+            let wanted = capacity.min(end - position);
+            file.read_exact_at(&mut buffer[..wanted], position as u64).unwrap();
+            // Whole lines only; word loads may run into PAD bytes past the last LF.
+            let whole = buffer[..wanted].iter().rposition(|&b| b == b'\n').unwrap() + 1;
+            unsafe { self.parse_lines(&buffer[..whole], position, names) };
+            position += whole;
         }
         let used = self.cursor.iter().filter(|&&c| c != 0).count();
         self.hours_left = AtomicU32::new(used as u32);
+    }
+
+    #[inline(always)]
+    unsafe fn parse_lines(&mut self, lines: &[u8], file_offset: usize, names: &Interner) {
+        let origin = lines.as_ptr();
+        let mut p = origin;
+        let stop = origin.add(lines.len());
+        while p < stop {
+            // "2026-10-30T18:..": the span is fixed, so the day's last digit plus whether the
+            // tens digit is '3' (October, bit 0 set) gives the day index directly.
+            let day = (*p.add(9) & 15) as usize + 1 - (*p.add(8) & 1) as usize;
+            let hour = (*p.add(11) & 15) as usize * 10 + (*p.add(12) & 15) as usize;
+            let bucket = day * 24 + hour - 18;
+            let endpoint = p.add(29 + first_byte(load(p.add(28)), b' '));
+            let len = until_space(endpoint);
+            let offset = file_offset + (endpoint as usize - origin as usize);
+            let slot = names.intern(endpoint, len, offset) as u32;
+            let status = endpoint.add(len + 1);
+            let error = ((*status == b'5') as u32) << LAT_BITS;
+            let (latency, digits) = parse_latency(status.add(4));
+            let tag = slot << (LAT_BITS + 1) | error;
+            if latency < SPILL {
+                self.push(bucket, tag | latency);
+            } else {
+                // A pair never straddles blocks: a marker in a block's last word is a filler.
+                if self.cursor[bucket] as usize % BLOCK == BLOCK - 1 {
+                    self.push(bucket, SPILL);
+                }
+                self.push(bucket, tag | SPILL);
+                self.push(bucket, latency);
+            }
+            p = status.add(5 + digits);
+        }
     }
 
     /// Calls `f(slot, is_error, latency)` for every record of an hour.
@@ -379,13 +395,16 @@ fn main() {
     let claim = AtomicUsize::new(0);
     thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
-                let i = claim.fetch_add(1, Relaxed);
-                if i >= SEGMENTS {
-                    return;
+            scope.spawn(|| {
+                let mut buffer = vec![0u8; READ_BYTES + PAD];
+                loop {
+                    let i = claim.fetch_add(1, Relaxed);
+                    if i >= SEGMENTS {
+                        return;
+                    }
+                    let (from, to) = (line_start(input, i * len / SEGMENTS), line_start(input, (i + 1) * len / SEGMENTS));
+                    pending[i].lock().unwrap().parse(&file, from, to, &names, &mut buffer);
                 }
-                let (from, to) = (line_start(input, i * len / SEGMENTS), line_start(input, (i + 1) * len / SEGMENTS));
-                pending[i].lock().unwrap().parse(input, from, to, &names);
             });
         }
     });
