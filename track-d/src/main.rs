@@ -8,59 +8,22 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
-use std::{env, ptr, slice, thread};
+use std::{env, slice, thread};
 
 const NODE_BITS: u32 = 21;
 const WEIGHT_BITS: u32 = 32 - NODE_BITS;
 const HEAVY: u32 = (1 << WEIGHT_BITS) - 1; // Packed weight meaning "look it up in the side table".
 const PARTITIONS: usize = 128;
-const HUGE: usize = 1 << 21;
 
 // A heap key packs (distance << NODE_BITS | node), so a distance has 43 bits. The generator's only
 // weights above 2^22 are single edges next to the special nodes, far below that; relaxing checks it.
 const DIST_MASK: u64 = (1 << (64 - NODE_BITS)) - 1;
 
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
-const MAP_FIXED: i32 = 0x10;
-#[cfg(target_os = "linux")]
-const MAP_ANON: i32 = 0x20;
-#[cfg(not(target_os = "linux"))]
-const MAP_ANON: i32 = 0x1000;
-
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
-}
-
-/// Maps a file with one zeroed page behind it, so word reads may run past the end of the data.
-fn map_file(path: String) -> &'static [u8] {
-    let file = File::open(path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
-    unsafe {
-        let base = mmap(ptr::null_mut(), len + 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
-        assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0), base);
-        slice::from_raw_parts(base, len)
-    }
-}
-
-/// Zeroed u32 array. The huge page request is overridden by the process-wide opt-out in `main`.
-fn huge_u32s(n: usize) -> &'static mut [u32] {
-    const PROT_RW: i32 = 3;
-    const MADV_HUGEPAGE: i32 = 14;
-    let bytes = (n * 4).next_multiple_of(HUGE);
-    unsafe {
-        let raw = mmap(ptr::null_mut(), bytes + HUGE, PROT_RW, MAP_PRIVATE | MAP_ANON, -1, 0);
-        let base = raw.add(raw.align_offset(HUGE));
-        madvise(base, bytes, MADV_HUGEPAGE);
-        slice::from_raw_parts_mut(base as *mut u32, n)
-    }
 }
 
 /// Parses the decimal number at `p` (ended by a space or LF); returns it and the byte after the end.
@@ -93,8 +56,8 @@ type Buckets = Vec<Vec<(u32, u32)>>;
 
 /// One direction of the graph.
 struct Csr {
-    offsets: &'static mut [u32],
-    edges: &'static mut [u32],
+    offsets: Vec<u32>,
+    edges: Vec<u32>,
 }
 
 impl Csr {
@@ -109,8 +72,8 @@ impl Csr {
         for p in 0..PARTITIONS {
             starts[p + 1] += starts[p];
         }
-        let offsets = huge_u32s(n + 1);
-        let edges = huge_u32s(starts[PARTITIONS]);
+        let mut offsets = vec![0u32; n + 1];
+        let mut edges = vec![0u32; starts[PARTITIONS]];
         let (off, out) = (offsets.as_mut_ptr() as usize, edges.as_mut_ptr() as usize);
         let claim = AtomicUsize::new(0);
         thread::scope(|scope| {
@@ -154,8 +117,8 @@ impl Csr {
     /// worker touches are mostly on nearby lines, and no edge list is held twice in memory.
     fn reversed(forward: &Csr) -> Csr {
         let n = forward.offsets.len() - 1;
-        let offsets = huge_u32s(n + 1);
-        let edges = huge_u32s(forward.edges.len());
+        let mut offsets = vec![0u32; n + 1];
+        let mut edges = vec![0u32; forward.edges.len()];
         let counters = unsafe { slice::from_raw_parts(offsets.as_ptr() as *const AtomicU32, n + 1) };
         let for_each_edge = |visit: &(dyn Fn(u32, u32) + Sync)| {
             let claim = AtomicUsize::new(0);
@@ -188,14 +151,6 @@ impl Csr {
             *(out as *mut u32).add(at as usize) = u << WEIGHT_BITS | (e & HEAVY);
         });
         Csr { offsets, edges }
-    }
-
-    /// Returns both arrays to the kernel at once.
-    fn free(self) {
-        for array in [&*self.offsets, &*self.edges] {
-            let bytes = (array.len() * 4).next_multiple_of(HUGE);
-            unsafe { munmap(array.as_ptr() as *mut u8, bytes) };
-        }
     }
 
     #[inline(always)]
@@ -266,9 +221,9 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let rank_at = rank.as_mut_ptr() as usize;
-    let offsets = huge_u32s(n + 1);
+    let mut offsets = vec![0u32; n + 1];
     let total: usize = orders.iter().map(|o| o.1).sum();
-    let edges = huge_u32s(total);
+    let mut edges = vec![0u32; total];
     offsets[n] = total as u32;
     let (off_at, out_at) = (offsets.as_mut_ptr() as usize, edges.as_mut_ptr() as usize);
     thread::scope(|scope| {
@@ -303,7 +258,7 @@ fn relabel(n: usize, old: Csr) -> (Vec<u32>, Csr) {
             });
         }
     });
-    old.free();
+    drop(old);
     (rank, Csr { offsets, edges })
 }
 
@@ -315,8 +270,11 @@ struct Graph {
 }
 
 impl Graph {
-    fn parse(input: &'static [u8], file: &File) -> (Vec<u32>, Graph) {
-        let mut p = input.as_ptr();
+    fn parse(file: &File) -> (Vec<u32>, Graph) {
+        let len = file.metadata().unwrap().len() as usize;
+        let mut header = [0u8; 64];
+        file.read_at(&mut header, 0).unwrap();
+        let mut p = header.as_ptr();
         let (n, m);
         unsafe {
             (n, p) = number(p);
@@ -325,7 +283,7 @@ impl Graph {
         let (n, m) = (n as usize, m as usize);
         assert!(n < (1 << NODE_BITS) - 1);
         let shift = ((n.max(2) - 1).ilog2() + 1).saturating_sub(PARTITIONS.ilog2());
-        let start = p as usize - input.as_ptr() as usize;
+        let start = p as usize - header.as_ptr() as usize;
 
         // Workers claim newline-aligned chunks and spill forward edges into per-partition buckets.
         // Each chunk is read into a buffer that stays in this core's L2 while it is parsed.
@@ -335,8 +293,9 @@ impl Graph {
             if at <= start {
                 return start;
             }
-            let at = at.min(input.len());
-            at + input[at..].iter().position(|&b| b == b'\n').map_or(input.len() - at, |i| i + 1)
+            let mut probe = [0u8; 64];
+            let got = file.read_at(&mut probe, at.min(len) as u64).unwrap();
+            at.min(len) + probe[..got].iter().position(|&b| b == b'\n').map_or(got, |i| i + 1)
         };
         let heavy = Mutex::new(Vec::new());
         let parts: Vec<Buckets> = thread::scope(|scope| {
@@ -351,7 +310,7 @@ impl Graph {
                         loop {
                             let i = claim.fetch_add(1, Relaxed);
                             let (from, to) = (start + i * CHUNK, start + (i + 1) * CHUNK);
-                            if from >= input.len() {
+                            if from >= len {
                                 heavy.lock().unwrap().extend_from_slice(&local_heavy);
                                 return buckets;
                             }
@@ -612,7 +571,7 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/graph.txt")).unwrap();
-    let (rank, graph) = Graph::parse(map_file(format!("{data}/graph.txt")), &file);
+    let (rank, graph) = Graph::parse(&file);
     let text = std::fs::read(format!("{data}/queries.txt")).unwrap();
     let mut queries = Vec::new();
     let mut fields = text.split(|&b| b == b' ' || b == b'\n').filter(|f| !f.is_empty()).map(|f| {

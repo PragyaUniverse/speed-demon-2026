@@ -6,7 +6,6 @@
 //! returned to the kernel when its last hour is done, because the log is roughly time-ordered:
 //! the record store shrinks while the output grows, and peak memory is the larger of the two.
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
@@ -31,7 +30,6 @@ const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819202122232425
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
-const MAP_FIXED: i32 = 0x10;
 const MADV_DONTNEED: i32 = 4; // Drops the pages at once.
 #[cfg(target_os = "linux")]
 const MAP_ANON: i32 = 0x20;
@@ -48,17 +46,6 @@ extern "C" {
 /// Anonymous memory: only pages actually touched count toward the peak.
 fn reserve(bytes: usize) -> *mut u8 {
     unsafe { mmap(ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) }
-}
-
-/// Maps the file with one zeroed page behind it, so the word-at-a-time reads below may run past
-/// the last line without a bounds check even when the file ends exactly on a page boundary.
-fn map_input(file: &File, len: usize) -> &'static [u8] {
-    unsafe {
-        let base = reserve(len + 4096);
-        let got = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
-        assert_eq!(got, base);
-        slice::from_raw_parts(base, len)
-    }
 }
 
 #[inline(always)]
@@ -105,10 +92,9 @@ unsafe fn until_space(p: *const u8) -> usize {
 }
 
 /// Lock-free endpoint interner shared by all workers. After the first few thousand lines it is
-/// read-only, so its cache lines stay shared. A slot packs (file offset + 1) << 8 | length.
+/// read-only, so its cache lines stay shared. A slot packs (address of a copy) << 8 | length.
 struct Interner {
     slots: Vec<AtomicU64>,
-    input: &'static [u8],
 }
 
 impl Interner {
@@ -118,12 +104,11 @@ impl Interner {
         if packed == 0 {
             return &[];
         }
-        let off = (packed >> 8) as usize - 1;
-        &self.input[off..off + (packed & 255) as usize]
+        unsafe { slice::from_raw_parts((packed >> 8) as *const u8, (packed & 255) as usize) }
     }
 
     #[inline(always)]
-    unsafe fn intern(&self, p: *const u8, len: usize, offset: usize) -> usize {
+    unsafe fn intern(&self, p: *const u8, len: usize) -> usize {
         // Sampling head, middle and tail keeps hashing O(1); equality is still byte-exact.
         let head = load(p) & (u64::MAX >> (64 - 8 * len.min(8)));
         let (mid, tail) = if len >= 8 { (load(p.add(len / 2 - 4)), load(p.add(len - 8))) } else { (0, 0) };
@@ -133,7 +118,8 @@ impl Interner {
         loop {
             let packed = self.slots.get_unchecked(slot).load(Acquire);
             if packed == 0 {
-                let new = (offset as u64 + 1) << 8 | len as u64;
+                let copy: &'static [u8] = Box::leak(key.to_vec().into_boxed_slice());
+                let new = (copy.as_ptr() as u64) << 8 | len as u64;
                 if self.slots[slot].compare_exchange(0, new, AcqRel, Acquire).is_ok() {
                     return slot;
                 }
@@ -169,12 +155,14 @@ unsafe fn parse_latency(p: *const u8) -> (u32, usize) {
     ((v.wrapping_mul(42949672960001) >> 32) as u32, k)
 }
 
-/// First line start at or after `from`.
-fn line_start(input: &[u8], from: usize) -> usize {
-    if from == 0 || from >= input.len() {
-        return from.min(input.len());
+/// First line start at or after `from`; lines are far shorter than the probe.
+fn line_start(file: &File, len: usize, from: usize) -> usize {
+    if from == 0 || from >= len {
+        return from.min(len);
     }
-    from + input[from..].iter().position(|&b| b == b'\n').map_or(input.len() - from, |i| i + 1)
+    let mut probe = [0u8; 256];
+    let got = file.read_at(&mut probe, from as u64).unwrap();
+    from + probe[..got].iter().position(|&b| b == b'\n').map_or(got, |i| i + 1)
 }
 
 /// The records of one file segment. Each hour's words form a chain of BLOCK-aligned blocks.
@@ -216,7 +204,7 @@ impl Segment {
             file.read_exact_at(&mut buffer[..wanted], position as u64).unwrap();
             // Whole lines only; word loads may run into PAD bytes past the last LF.
             let whole = buffer[..wanted].iter().rposition(|&b| b == b'\n').unwrap() + 1;
-            unsafe { self.parse_lines(&buffer[..whole], position, names) };
+            unsafe { self.parse_lines(&buffer[..whole], names) };
             position += whole;
         }
         let used = self.cursor.iter().filter(|&&c| c != 0).count();
@@ -224,10 +212,9 @@ impl Segment {
     }
 
     #[inline(always)]
-    unsafe fn parse_lines(&mut self, lines: &[u8], file_offset: usize, names: &Interner) {
-        let origin = lines.as_ptr();
-        let mut p = origin;
-        let stop = origin.add(lines.len());
+    unsafe fn parse_lines(&mut self, lines: &[u8], names: &Interner) {
+        let mut p = lines.as_ptr();
+        let stop = p.add(lines.len());
         while p < stop {
             // "2026-10-30T18:..": the span is fixed, so the day's last digit plus whether the
             // tens digit is '3' (October, bit 0 set) gives the day index directly.
@@ -236,8 +223,7 @@ impl Segment {
             let bucket = day * 24 + hour - 18;
             let endpoint = p.add(29 + first_byte(load(p.add(28)), b' '));
             let len = until_space(endpoint);
-            let offset = file_offset + (endpoint as usize - origin as usize);
-            let slot = names.intern(endpoint, len, offset) as u32;
+            let slot = names.intern(endpoint, len) as u32;
             let status = endpoint.add(len + 1);
             let error = ((*status == b'5') as u32) << LAT_BITS;
             let (latency, digits) = parse_latency(status.add(4));
@@ -380,9 +366,8 @@ fn main() {
     if len == 0 {
         return;
     }
-    let input = map_input(&file, len);
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
-    let names = Interner { slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect(), input };
+    let names = Interner { slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect() };
 
     let empty = || Segment {
         arena: ptr::null_mut(),
@@ -402,7 +387,7 @@ fn main() {
                     if i >= SEGMENTS {
                         return;
                     }
-                    let (from, to) = (line_start(input, i * len / SEGMENTS), line_start(input, (i + 1) * len / SEGMENTS));
+                    let (from, to) = (line_start(&file, len, i * len / SEGMENTS), line_start(&file, len, (i + 1) * len / SEGMENTS));
                     pending[i].lock().unwrap().parse(&file, from, to, &names, &mut buffer);
                 }
             });

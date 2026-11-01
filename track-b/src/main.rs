@@ -7,10 +7,9 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
-use std::{env, ptr, slice, thread};
+use std::{env, ptr, thread};
 
 const CHUNK_BYTES: usize = 1 << 21;
 const REL_BITS: u32 = 12; // A 2 MB chunk holds about 2,000 documents; asserted to fit in 4,096.
@@ -22,31 +21,9 @@ const NONE: u32 = u32::MAX;
 const FREQUENT: u32 = 8;
 const STRIDE: usize = 1 << (REL_BITS - 6); // Words per bitset row, enough for any chunk.
 
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
-const MAP_FIXED: i32 = 0x10;
-#[cfg(target_os = "linux")]
-const MAP_ANON: i32 = 0x20;
-#[cfg(not(target_os = "linux"))]
-const MAP_ANON: i32 = 0x1000;
-
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
-}
-
-/// Maps a file with one zeroed page behind it, so block reads may run past the end of the data.
-fn map_file(path: String) -> &'static [u8] {
-    let file = File::open(path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
-    unsafe {
-        let base = mmap(ptr::null_mut(), len + 128 * 1024, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if len > 0 {
-            assert_eq!(mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0), base);
-        }
-        slice::from_raw_parts(base, len)
-    }
 }
 
 #[inline(always)]
@@ -641,11 +618,13 @@ unsafe fn phrase_at(q: &Queries, phrase: &Phrase, at: *const u8) -> bool {
 }
 
 /// First document start at or after `from`.
-fn doc_start(input: &[u8], from: usize) -> usize {
-    if from == 0 || from >= input.len() {
-        return from.min(input.len());
+fn doc_start(file: &File, len: usize, from: usize) -> usize {
+    if from == 0 || from >= len {
+        return from.min(len);
     }
-    from + input[from..].iter().position(|&b| b == b'\n').map_or(input.len() - from, |i| i + 1)
+    let mut probe = [0u8; 1 << 16];
+    let got = file.read_at(&mut probe, from as u64).unwrap();
+    from + probe[..got].iter().position(|&b| b == b'\n').map_or(got, |i| i + 1)
 }
 
 fn push_number(out: &mut Vec<u8>, mut v: u64) {
@@ -672,14 +651,16 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/docs.txt")).unwrap();
-    let input = map_file(format!("{data}/docs.txt"));
-    let mut q = parse_queries(map_file(format!("{data}/queries.txt")));
-    let sample_end = doc_start(input, SAMPLE_BYTES);
-    let frequency = sample_frequencies(&q, &input[..sample_end]);
+    let len = file.metadata().unwrap().len() as usize;
+    let mut q = parse_queries(std::fs::read(format!("{data}/queries.txt")).unwrap().leak());
+    let sample_end = doc_start(&file, len, SAMPLE_BYTES);
+    let mut sample = vec![0u8; sample_end + 2 * PAD];
+    file.read_exact_at(&mut sample[..sample_end], 0).unwrap();
+    let frequency = sample_frequencies(&q, &sample[..sample_end]);
     let plan = make_plan(&mut q, &frequency);
 
     let threads = thread::available_parallelism().map_or(12, |n| n.get()).min(12);
-    let chunks = input.len().div_ceil(CHUNK_BYTES);
+    let chunks = len.div_ceil(CHUNK_BYTES);
     let shared = Shared {
         q: &q,
         plan: &plan,
@@ -699,7 +680,7 @@ fn main() {
                         if i >= chunks {
                             return std::mem::take(&mut worker.hits);
                         }
-                        let (from, to) = (doc_start(input, i * CHUNK_BYTES), doc_start(input, (i + 1) * CHUNK_BYTES));
+                        let (from, to) = (doc_start(&file, len, i * CHUNK_BYTES), doc_start(&file, len, (i + 1) * CHUNK_BYTES));
                         let (base, docs) = worker.scan(&file, from, to, &shared);
                         let words = docs.div_ceil(64).max(1);
                         worker.invert(words, plan.frequent);
