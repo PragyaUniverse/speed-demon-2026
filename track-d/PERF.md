@@ -36,3 +36,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | b6d9209 | Do not queue a node that cannot beat the best path | run-b5409bb3a712 | 167 | 83.7 | 8% faster in the VM (94 to 87 ms), within noise on the box. Kept, since it costs 3 lines |
 | 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
+| d271ae5 | PROBE: spawn 12 threads and exit | run-8c55780453ed | 0.9 | 7.8 | Thread start-up is not the problem |

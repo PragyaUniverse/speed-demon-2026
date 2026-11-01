@@ -34,3 +34,6 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | b6d9209 | 128 KB reads | run-299c5c6d3e3f | 66.6 | 22.9 | An outlier, and only 0.5 MB saved. **Reverted** |
 | 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
+| b9545ea | 64-byte space search, 72 segments | run-52444b3e7a49 | 27.8 | 23.9 | Second sample run-50a18a40c017 28.3. **No gain, reverted** |
+| d271ae5 | PROBE: exit at once | run-082e17bc0271 | 0.4 | 8.1 | A program that does nothing peaks at 8 MB, so memory has a floor well above the 4.6 MB that would earn the full factor |
+| 2a02156 | Constant-cost name compare instead of `memcmp` per line | run-949d4b8a810c | 29.3 | 22.8 | Second sample run-8a5b04af0509 27.4. Local count: parsing 254 instructions per line, output about 100. **No gain for 20 lines, reverted** |

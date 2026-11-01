@@ -30,3 +30,5 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | b6d9209 | Name batches of 512 | run-802e178c7c4b | 40.5 | 11.6 | About 1 ms for 1.4 MB. **Reverted** |
 | 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
+| b9545ea | 64-byte quote search, loop-free hash for short names | run-779fd07fbc9d | 42.5 | 9.9 | Second sample run-b0c5f801f0ee 41.2. **No gain, reverted** |
+| d271ae5 | PROBE: touch every cache line of the mapping, no parsing | run-22cb43d6855b | 11.3 | 8.2 | Input alone costs 11.3 ms, leaving about 30 ms of my compute |

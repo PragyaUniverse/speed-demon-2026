@@ -31,3 +31,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | de12444 | Remove the mapping entirely | run-87256012fabc | 281 | 45.4 | S 772 to 739 for the same work |
 | 08cf96c | My mistake, not an experiment: a failed revert left the diagnostic in, and I pushed without checking | ID not captured | | | Failed on exit code 3. Since then every push goes through `tools/push.sh`, which stops if any hash fails |
 | 58784c5 and later | Later probes for this track are in the rows above | | | | |
+| d271ae5 | PROBE: read the whole file on 12 threads, no parsing | run-31e2afaca84e | 11.6 | 7.3 | Just getting the bytes takes 11.6 ms, a large share of what the fastest entry on this track spends in total |

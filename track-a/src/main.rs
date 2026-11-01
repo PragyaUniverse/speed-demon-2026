@@ -12,9 +12,9 @@ use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const HOURS: usize = 72;
-const SEGMENTS: usize = 72;
+const SEGMENTS: usize = 24;
 const READ_BYTES: usize = 1 << 18;
-const PAD: usize = 128;
+const PAD: usize = 64;
 const BLOCK: usize = 256; // Words per block; the first word links to the hour's previous block.
 const SLOT_BITS: u32 = 12;
 const SLOTS: usize = 1 << SLOT_BITS; // 1,842 endpoints per seed: the table stays under half full.
@@ -61,24 +61,20 @@ fn first_byte(word: u64, b: u8) -> usize {
     (found.trailing_zeros() / 8) as usize
 }
 
-/// Length of the run of bytes before the next space. Endpoints average 33 bytes, so a 32-byte step
-/// would mispredict its loop exit on nearly half the lines; 64 bytes at once almost never loops.
+/// Length of the run of bytes before the next space.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
 unsafe fn until_space(p: *const u8) -> usize {
     use std::arch::x86_64::*;
     let spaces = _mm256_set1_epi8(b' ' as i8);
-    let mask = |q: *const u8| {
-        let v = _mm256_loadu_si256(q as *const __m256i);
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, spaces)) as u32 as u64
-    };
     let mut n = 0;
     loop {
-        let m = mask(p.add(n)) | mask(p.add(n + 32)) << 32;
+        let v = _mm256_loadu_si256(p.add(n) as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, spaces)) as u32;
         if m != 0 {
             return n + m.trailing_zeros() as usize;
         }
-        n += 64;
+        n += 32;
     }
 }
 
@@ -93,29 +89,6 @@ unsafe fn until_space(p: *const u8) -> usize {
         }
         n += 8;
     }
-}
-
-/// Whether two names of the same length match. Up to 64 bytes this is a constant-cost compare with
-/// no call and no length-dependent branch, and it runs once per line.
-#[cfg(target_feature = "avx2")]
-#[inline(always)]
-unsafe fn same_name(a: *const u8, b: *const u8, len: usize) -> bool {
-    use std::arch::x86_64::*;
-    if len > 64 {
-        return slice::from_raw_parts(a, len) == slice::from_raw_parts(b, len);
-    }
-    let equal = |at: usize| {
-        let x = _mm256_loadu_si256(a.add(at) as *const __m256i);
-        let y = _mm256_loadu_si256(b.add(at) as *const __m256i);
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64
-    };
-    (equal(0) | equal(32) << 32 | (u64::MAX << 1 << (len - 1))) == u64::MAX
-}
-
-#[cfg(not(target_feature = "avx2"))]
-#[inline(always)]
-unsafe fn same_name(a: *const u8, b: *const u8, len: usize) -> bool {
-    slice::from_raw_parts(a, len) == slice::from_raw_parts(b, len)
 }
 
 /// Lock-free endpoint interner shared by all workers. After the first few thousand lines it is
@@ -145,16 +118,14 @@ impl Interner {
         loop {
             let packed = self.slots.get_unchecked(slot).load(Acquire);
             if packed == 0 {
-                // Padded to 64 bytes, so that `same_name` may always load a full block.
-                let mut copy = key.to_vec();
-                copy.resize(len.max(64), 0);
-                let new = (copy.leak().as_ptr() as u64) << 8 | len as u64;
+                let copy: &'static [u8] = Box::leak(key.to_vec().into_boxed_slice());
+                let new = (copy.as_ptr() as u64) << 8 | len as u64;
                 if self.slots[slot].compare_exchange(0, new, AcqRel, Acquire).is_ok() {
                     return slot;
                 }
                 continue; // Lost the race: re-read the slot, the winner may hold our key.
             }
-            if packed & 255 == len as u64 && same_name((packed >> 8) as *const u8, p, len) {
+            if packed & 255 == len as u64 && self.name(slot) == key {
                 return slot;
             }
             slot = (slot + 1) & (SLOTS - 1);
