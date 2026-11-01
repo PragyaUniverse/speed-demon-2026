@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
-const CHUNK_BYTES: usize = 1 << 20;
+const CHUNK_BYTES: usize = 1 << 21;
 const REL_BITS: u32 = 14; // A chunk of 4 MB holds about 4,000 documents; asserted to fit in 16,384.
 const SAMPLE_BYTES: usize = 1 << 18;
 const READ_BYTES: usize = 1 << 18;
@@ -131,41 +131,51 @@ unsafe fn for_each_token(mut p: *const u8, mut f: impl FnMut(*const u8, *const u
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    head: u64,
-    tail: u64,
-    len: u32,
-    term: u32,
-}
+const TERM_BITS: u32 = 18;
+const TABLE_BITS: u32 = 17;
 
-/// Every distinct query term, addressed by token key. Read-only once the workers start.
+/// Every distinct query term, addressed by a hash of the token. One u64 per slot, a table of 1 MB,
+/// because every token probes it and it must stay in a core's 1.25 MB L2. A slot keeps 46 more hash
+/// bits beside term + 1, so a match means 63 bits agree: about 5e-9 chance of any false match in a
+/// run, given 610,000 distinct tokens against 76,000 terms.
 struct Terms {
-    slots: Vec<Slot>,
-    bits: u32,
-    /// Query-file text of each term; only needed to tell apart terms over 16 bytes.
+    slots: Vec<u64>,
     text: Vec<&'static [u8]>,
 }
 
-impl Terms {
-    #[inline(always)]
-    fn start(&self, head: u64, tail: u64, len: usize) -> usize {
-        let mixed = head ^ tail.rotate_left(17) ^ len as u64;
-        (mixed.wrapping_mul(0x9E3779B97F4A7C15) >> (64 - self.bits)) as usize
+/// Mixes a token's key: head, tail and length, plus the middle for tokens over 16 bytes (rare).
+#[inline(always)]
+unsafe fn token_hash(p: *const u8, len: usize) -> u64 {
+    let (head, tail) = token_key(p, len);
+    let mut h = head ^ tail.rotate_left(23).wrapping_mul(0xC2B2AE3D27D4EB4F) ^ len as u64;
+    if len > 16 {
+        h = hash_middle(h, p, len);
     }
+    h = h.wrapping_mul(0x9E3779B97F4A7C15);
+    h ^ (h >> 29)
+}
 
+#[cold]
+unsafe fn hash_middle(mut h: u64, p: *const u8, len: usize) -> u64 {
+    for i in 8..len - 8 {
+        h = (h ^ (*p.add(i) | 0x20) as u64).wrapping_mul(0x100000001B3);
+    }
+    h
+}
+
+impl Terms {
     fn intern(&mut self, word: &'static [u8]) -> u32 {
-        let (head, tail) = unsafe { token_key(word.as_ptr(), word.len()) };
-        let mut i = self.start(head, tail, word.len());
+        let h = unsafe { token_hash(word.as_ptr(), word.len()) };
+        let mut i = (h >> (64 - TABLE_BITS)) as usize;
         loop {
-            let s = &self.slots[i];
-            if s.len == 0 {
-                self.slots[i] = Slot { head, tail, len: word.len() as u32, term: self.text.len() as u32 };
+            let slot = self.slots[i];
+            if slot == 0 {
                 self.text.push(word);
+                self.slots[i] = h << TERM_BITS | self.text.len() as u64;
                 return self.text.len() as u32 - 1;
             }
-            if s.head == head && s.tail == tail && s.len as usize == word.len() && self.text[s.term as usize] == word {
-                return s.term;
+            if slot >> TERM_BITS == h << TERM_BITS >> TERM_BITS {
+                return (slot & ((1 << TERM_BITS) - 1)) as u32 - 1;
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -174,25 +184,18 @@ impl Terms {
     /// The term a token is, or NONE.
     #[inline(always)]
     unsafe fn find(&self, p: *const u8, len: usize) -> u32 {
-        let (head, tail) = token_key(p, len);
-        let mut i = self.start(head, tail, len);
+        let h = token_hash(p, len);
+        let mut i = (h >> (64 - TABLE_BITS)) as usize;
         loop {
-            let s = self.slots.get_unchecked(i);
-            if s.head == head && s.tail == tail && s.len as usize == len {
-                if len <= 16 || self.matches(s.term, p, len) {
-                    return s.term;
-                }
-            } else if s.len == 0 {
+            let slot = *self.slots.get_unchecked(i);
+            if slot >> TERM_BITS == h << TERM_BITS >> TERM_BITS && slot != 0 {
+                return (slot & ((1 << TERM_BITS) - 1)) as u32 - 1;
+            }
+            if slot == 0 {
                 return NONE;
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
-    }
-
-    #[cold]
-    unsafe fn matches(&self, term: u32, p: *const u8, len: usize) -> bool {
-        let token = slice::from_raw_parts(p, len);
-        token.iter().zip(self.text[term as usize]).all(|(&a, &b)| a.to_ascii_lowercase() == b)
     }
 }
 
@@ -222,7 +225,7 @@ struct Queries {
 
 fn parse_queries(text: &'static [u8]) -> Queries {
     let mut q = Queries {
-        terms: Terms { slots: vec![Slot::default(); 1 << 18], bits: 18, text: Vec::new() },
+        terms: Terms { slots: vec![0; 1 << TABLE_BITS], text: Vec::new() },
         bool_ops: Vec::new(),
         bools: Vec::new(),
         phrases: Vec::new(),
