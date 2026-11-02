@@ -43,3 +43,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | ed87b79 | Two-stage tokeniser: all token boundaries first, then lookups | run-c8c252c5b5af | 293 | 48.7 | Samples run-e50fdf7ee5b8 309, run-648804c45b26 297. Correct but slower, as with Track C's parser, and 33 lines longer. **Reverted** |
 | a6841ff | 1.5 MB chunks | run-d8faeedac28a | 284 | 43.8 | Samples run-5ea383c1d8b0 291, run-4afa6c9d8533 294. Under the 44 MB point where memory stops earning, no time lost. K 22.9 to 23.3. **Kept** |
 | 0dadcf7 | gcc:16 instead of gcc:15 | run-9c578cde061b | 285 | 43.4 | Second sample run-33f0c6aca17e 286. K 23.2, steady. **Kept** |
+| 56ec956 | One-probe L1 table for frequent terms; absent terms skip a miss in evaluation | run-9b00fb226940 | 291 | 43.8 | Samples run-f5f140faf54c 291, run-ef08aa42fc8c 287. No gain for 24 lines, so L2 misses on common words are not the main cost. **Reverted** |
