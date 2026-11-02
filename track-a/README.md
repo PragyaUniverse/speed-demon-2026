@@ -2,7 +2,7 @@
 
 **Approach.** Workers claim 24 newline-aligned file segments and read each through a 256 KB buffer, which measured faster on the scoring box than parsing a mapping of the file. Each line is parsed with constant-time word tricks and becomes one packed `u32` (endpoint slot, error bit, latency), chained into per-hour blocks in that segment's own arena. Endpoints go through a lock-free table that is effectively read-only after the first few thousand lines. A second parallel phase takes one hour at a time, lays its latencies out per endpoint, selects p50/p95/p99 with `select_nth_unstable`, and writes the hour's text directly at its final file offset. Huge pages are disabled for the process, because on the box they round each small thread arena up to 2 MB. Because the log is roughly time-ordered, a segment's last hour finishes early, and its arena goes back to the kernel while the output is still growing.
 
-**Dependencies.** None. `mmap`, `madvise` and `prctl` are declared by hand; `std` links libc anyway.
+**Dependencies.** None. `prctl` is declared by hand; `std` links libc anyway.
 
 **Assumptions from the spec.** Exactly 1,842 endpoints (the 4,096-slot table stays under half full), timestamps inside the fixed 72-hour span, well-formed lines.
 
