@@ -22,7 +22,6 @@ const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 
 const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 #[cfg(target_os = "linux")]
@@ -49,13 +48,10 @@ fn map_file(path: String) -> &'static [u8] {
     }
 }
 
-/// Zeroed atomics that cost memory only where they are touched.
-fn lazy_table<T>(n: usize) -> &'static [T] {
-    let bytes = n * std::mem::size_of::<T>();
-    unsafe {
-        let p = mmap(ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        slice::from_raw_parts(p as *const T, n)
-    }
+/// Zeroed atomics: a big zeroed allocation costs memory only where it is touched.
+fn lazy_table(n: usize) -> &'static [AtomicU64] {
+    let zeroed = vec![0u64; n].leak();
+    unsafe { slice::from_raw_parts(zeroed.as_ptr() as *const AtomicU64, n) }
 }
 
 #[inline(always)]
@@ -115,14 +111,7 @@ unsafe fn until(p: *const u8, b: u8) -> usize {
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn until(p: *const u8, b: u8) -> usize {
-    let mut n = 0;
-    loop {
-        let k = first_byte(load(p.add(n)), b);
-        if k < 8 {
-            return n + k;
-        }
-        n += 8;
-    }
+    (0..).find(|&n| *p.add(n) == b).unwrap()
 }
 
 /// A text field: its content bytes as written, its unescaped length, and where the next field is.
@@ -202,6 +191,10 @@ struct Shared {
 }
 
 impl Shared {
+    fn send(&self, line: usize, batch: &[u32]) {
+        self.inboxes[line % self.inboxes.len()].lock().unwrap().extend_from_slice(batch);
+    }
+
     /// Dense id of a name, claiming a slot and an id if it is new.
     #[inline(always)]
     fn name_id(&self, hash: u64) -> usize {
@@ -249,7 +242,7 @@ impl Worker {
         *len += 1;
         if *len == BATCH {
             *len = 0;
-            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(batch);
+            shared.send(line, batch);
             self.drain(shared);
         }
     }
@@ -268,7 +261,7 @@ impl Worker {
     /// Sends what is left, then keeps applying until no worker can send any more.
     fn finish(&mut self, shared: &Shared) {
         for (line, (len, batch)) in self.pending.iter().enumerate() {
-            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(&batch[..*len]);
+            shared.send(line, &batch[..*len]);
         }
         shared.finished.fetch_add(1, AcqRel);
         while shared.finished.load(Acquire) < shared.inboxes.len() {
