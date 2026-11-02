@@ -288,7 +288,10 @@ struct Worker {
     std::vector<std::pair<u32, u32>> hits;
 
     Worker(const Queries& q, const Plan& plan)
-        : last_doc(plan.bool_terms), counts(plan.bool_terms + 1), dense_of(plan.bool_terms, NONE), last_hit(q.phrases.size(), NONE), result(STRIDE), scratch(STRIDE), emitted(q.total), buffer(READ_BYTES + 2 * PAD) {}
+        : last_doc(plan.bool_terms), counts(plan.bool_terms + 1), dense_of(plan.bool_terms, NONE), last_hit(q.phrases.size(), NONE), result(STRIDE), scratch(STRIDE), emitted(q.total), buffer(READ_BYTES + 2 * PAD) {
+        // Sized once: unlike realloc, a growing vector holds old and new at once and leaves holes.
+        log.reserve(1 << 18), list.reserve(1 << 18), dense.reserve(1 << 17);
+    }
 
     // Tokenises file range [start, end) of whole documents; sets the base id and document count.
     // Bytes are read in pieces that stay in this core's L2, and phrases are verified on the spot,
@@ -438,7 +441,7 @@ struct Worker {
 // First document start at or after `from`.
 static size_t doc_start(int fd, size_t len, size_t from) {
     if (from == 0 || from >= len) return std::min(from, len);
-    static thread_local u8 probe[1 << 16];
+    u8 probe[1 << 14];  // Documents are far shorter.
     ssize_t got = pread(fd, probe, sizeof probe, from);
     for (ssize_t i = 0; i < got; i++)
         if (probe[i] == '\n') return from + i + 1;
@@ -502,6 +505,7 @@ int main() {
                     w.invert(words, plan.frequent);
                     firsts[i].base = base;
                     w.answer_bools(base, words, shared, firsts[i].entries);
+                    firsts[i].entries.shrink_to_fit();
                 }
                 hit_lists[t] = std::move(w.hits);
             });
@@ -524,8 +528,8 @@ int main() {
         counts[query]++, sums[query] += doc;
         if (filled[query] < 10) first_ten[query * 10 + filled[query]++] = doc;
     }
-    std::vector<char> text(q.total * 120 + 1);
-    char* w = text.data();
+    char* const text = (char*)malloc(q.total * 120 + 1);  // Worst case, and untouched pages cost nothing.
+    char* w = text;
     for (size_t i = 0; i < q.total; i++) {
         w = put(w, counts[i]);
         *w++ = ' ';
@@ -537,6 +541,6 @@ int main() {
         *w++ = '\n';
     }
     int output = open((out + "/results.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (output < 0 || write(output, text.data(), w - text.data()) != w - text.data()) abort();
+    if (output < 0 || write(output, text, w - text) != w - text) abort();
     _exit(0);  // Skip unmapping and destructors: the process is done and the clock is running.
 }
