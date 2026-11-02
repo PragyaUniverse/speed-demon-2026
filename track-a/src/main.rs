@@ -6,6 +6,7 @@
 //! returned to the kernel when its last hour is done, because the log is roughly time-ordered:
 //! the record store shrinks while the output grows, and peak memory is the larger of the two.
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
@@ -13,8 +14,6 @@ use std::{env, ptr, slice, thread};
 
 const HOURS: usize = 72;
 const SEGMENTS: usize = 24;
-const READ_BYTES: usize = 1 << 18;
-const PAD: usize = 64;
 const BLOCK: usize = 256; // Words per block; the first word links to the hour's previous block.
 const SLOT_BITS: u32 = 12;
 const SLOTS: usize = 1 << SLOT_BITS; // 1,842 endpoints per seed: the table stays under half full.
@@ -27,6 +26,7 @@ const SPILL: u32 = (1 << LAT_BITS) - 1;
 const DAYS: [&[u8; 11]; 4] = [b"2026-10-30T", b"2026-10-31T", b"2026-11-01T", b"2026-11-02T"];
 const PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 
+const MAP_FIXED: i32 = 0x10;
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
@@ -41,6 +41,7 @@ extern "C" {
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
 /// Anonymous memory: only pages actually touched count toward the peak.
@@ -190,23 +191,23 @@ impl Segment {
         *self.cursor.get_unchecked_mut(bucket) = at as u32 + 1;
     }
 
-    /// Parses every line of the file range [start, end); both ends are line starts. The bytes are
-    /// read into a buffer small enough to stay in this core's L2 while the lines are parsed.
-    fn parse(&mut self, file: &File, start: usize, end: usize, names: &Interner, buffer: &mut [u8]) {
+    /// Parses every line of the file range [start, end); both ends are line starts. The worker maps
+    /// just this range and unmaps it when done: at exit one thread would have to unmap the whole file,
+    /// on the clock. Word loads may run into the zero page behind the mapping.
+    fn parse(&mut self, file: &File, start: usize, end: usize, names: &Interner) {
         // Lines are at least 40 bytes and take at most 2 words: virtual space only, never touched.
         self.arena_bytes = (end - start) / 4 + (HOURS + 2) * BLOCK * 8;
         self.arena = reserve(self.arena_bytes) as *mut u32;
         self.next_block = BLOCK;
-        let capacity = buffer.len() - PAD;
-        let mut position = start;
-        while position < end {
-            let wanted = capacity.min(end - position);
-            file.read_exact_at(&mut buffer[..wanted], position as u64).unwrap();
-            // Whole lines only; word loads may run into PAD bytes past the last LF.
-            let whole = buffer[..wanted].iter().rposition(|&b| b == b'\n').unwrap() + 1;
-            unsafe { self.parse_lines(&buffer[..whole], names) };
-            position += whole;
-        }
+        let page = start / (1 << 14) * (1 << 14); // A multiple of every page size this runs on.
+        let bytes = end - page;
+        if end > start { unsafe {
+            let base = reserve(bytes + (1 << 15));
+            let got = mmap(base, bytes, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), page as i64);
+            assert_eq!(got, base);
+            self.parse_lines(slice::from_raw_parts(base.add(start - page), end - start), names);
+            munmap(base, bytes + (1 << 15));
+        } }
         let used = self.cursor.iter().filter(|&&c| c != 0).count();
         self.hours_left = AtomicU32::new(used as u32);
     }
@@ -381,14 +382,13 @@ fn main() {
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut buffer = vec![0u8; READ_BYTES + PAD];
                 loop {
                     let i = claim.fetch_add(1, Relaxed);
                     if i >= SEGMENTS {
                         return;
                     }
                     let (from, to) = (line_start(&file, len, i * len / SEGMENTS), line_start(&file, len, (i + 1) * len / SEGMENTS));
-                    pending[i].lock().unwrap().parse(&file, from, to, &names, &mut buffer);
+                    pending[i].lock().unwrap().parse(&file, from, to, &names);
                 }
             });
         }

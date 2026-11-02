@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const SEGMENTS: usize = 64;
+const PAGE: usize = 1 << 14; // A multiple of every page size this runs on.
 const UNMATCHED: usize = 0; // Group index; countries get 1, 2, ... in order of first appearance.
 
 // Names are interned in one shared table of 2^18 slots; the pool holds 100,000. A slot packs the
@@ -32,6 +33,7 @@ const MAP_ANON: i32 = 0x1000;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
 }
@@ -396,12 +398,13 @@ fn main() {
         i if i >= SEGMENTS => input.len(),
         i => record_start(input, (first + i * (input.len() - first) / SEGMENTS - 1).max(first)),
     };
+    let cuts: Vec<usize> = (0..=SEGMENTS).map(cut).collect();
     let claim = AtomicUsize::new(0);
     let mut totals = vec![EMPTY; count];
     thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|me| {
-                let (shared, cut, claim) = (&shared, &cut, &claim);
+                let (shared, cuts, claim) = (&shared, &cuts, &claim);
                 scope.spawn(move || {
                     let mut worker = Worker::new(me, count);
                     loop {
@@ -410,7 +413,14 @@ fn main() {
                             worker.finish(shared);
                             return worker.groups;
                         }
-                        parse_records(input, cut(i), cut(i + 1), shared, &mut worker);
+                        parse_records(input, cuts[i], cuts[i + 1], shared, &mut worker);
+                        // Unmapping here, in parallel, beats one thread unmapping all of it at exit,
+                        // which the clock would see. Neighbours may still read just past the edges.
+                        let from = (input.as_ptr() as usize + cuts[i] + 64).next_multiple_of(PAGE);
+                        let to = (input.as_ptr() as usize + cuts[i + 1]) / PAGE * PAGE;
+                        if to > from {
+                            unsafe { munmap(from as *mut u8, to - from) };
+                        }
                     }
                 })
             })
