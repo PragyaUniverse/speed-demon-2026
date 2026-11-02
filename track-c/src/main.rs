@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::Mutex;
 use std::{env, ptr, slice, thread};
 
 const SEGMENTS: usize = 64;
@@ -191,14 +190,9 @@ struct Shared {
     region_group: Vec<u8>,
     names: &'static [AtomicU64],
     next_name: AtomicU32,
-    /// Bit matrix: one row of `stride` words per 64 name ids, so ids stay dense in memory. Each
-    /// cache line (the eight groups sharing it) has one owning worker, the only one to touch it:
-    /// the matrix stays in that core's L2 instead of bouncing between cores on every record.
+    /// Bit matrix: one row of `stride` words per 64 name ids, so ids stay dense in memory.
     seen: &'static [AtomicU64],
     stride: usize,
-    /// Each worker's incoming (name id, group) pairs for the lines it owns.
-    inboxes: Vec<Mutex<Vec<u32>>>,
-    finished: AtomicUsize,
 }
 
 impl Shared {
@@ -226,56 +220,15 @@ impl Shared {
 
 }
 
-const BATCH: usize = 128;
-
-/// One worker's aggregates, plus its (name id, group) pairs on their way to the lines' owners.
-struct Worker {
-    me: usize,
-    groups: Vec<Group>,
-    pending: Vec<(usize, [u32; BATCH])>,
-    spare: Vec<u32>,
-}
-
-impl Worker {
-    fn new(me: usize, count: usize) -> Self {
-        Worker { me, groups: vec![EMPTY; count], pending: vec![(0, [0; BATCH]); count / 8 + 1], spare: Vec::new() }
-    }
-
+impl Shared {
+    /// Most repeats avoid the locked instruction and its store-buffer drain.
     #[inline(always)]
-    fn mark_name(&mut self, shared: &Shared, group: usize, id: usize) {
-        let line = group >> 3;
-        let (len, batch) = unsafe { self.pending.get_unchecked_mut(line) };
-        unsafe { *batch.get_unchecked_mut(*len) = (id as u32) << 8 | group as u32 };
-        *len += 1;
-        if *len == BATCH {
-            *len = 0;
-            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(batch);
-            self.drain(shared);
+    fn mark_name(&self, group: usize, id: usize) {
+        let word = unsafe { self.seen.get_unchecked((id >> 6) * self.stride + group) };
+        let bit = 1u64 << (id & 63);
+        if word.load(Relaxed) & bit == 0 {
+            word.fetch_or(bit, Relaxed);
         }
-    }
-
-    /// Applies everything sent to this worker. Only the owner writes, so plain stores suffice.
-    fn drain(&mut self, shared: &Shared) {
-        std::mem::swap(&mut *shared.inboxes[self.me].lock().unwrap(), &mut self.spare);
-        for &entry in &self.spare {
-            let (id, group) = ((entry >> 8) as usize, (entry & 255) as usize);
-            let word = unsafe { shared.seen.get_unchecked((id >> 6) * shared.stride + group) };
-            word.store(word.load(Relaxed) | 1u64 << (id & 63), Relaxed);
-        }
-        self.spare.clear();
-    }
-
-    /// Sends what is left, then keeps applying until no worker can send any more.
-    fn finish(&mut self, shared: &Shared) {
-        for (line, (len, batch)) in self.pending.iter().enumerate() {
-            shared.inboxes[line % shared.inboxes.len()].lock().unwrap().extend_from_slice(&batch[..*len]);
-        }
-        shared.finished.fetch_add(1, AcqRel);
-        while shared.finished.load(Acquire) < shared.inboxes.len() {
-            self.drain(shared);
-            std::hint::spin_loop();
-        }
-        self.drain(shared);
     }
 }
 
@@ -291,7 +244,7 @@ fn record_start(input: &[u8], mut from: usize) -> usize {
 }
 
 /// Aggregates the records of input[start..end] into this worker's groups.
-fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker: &mut Worker) {
+fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, groups: &mut [Group]) {
     let regions = shared.region_group.as_ptr();
     let last_region = shared.region_group.len() as u64 - 1;
     unsafe {
@@ -320,7 +273,7 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker
             p = amount_at.add(k + 1 + (*amount_at.add(k) == b'\r') as usize);
 
             let group = *regions.add(region.min(last_region) as usize) as usize;
-            let g = worker.groups.get_unchecked_mut(group);
+            let g = groups.get_unchecked_mut(group);
             g.count += 1;
             g.id_sum += id;
             g.amount_sum += amount;
@@ -328,7 +281,7 @@ fn parse_records(input: &[u8], start: usize, end: usize, shared: &Shared, worker
             g.amount_max = g.amount_max.max(amount);
             g.name_bytes += name_len as u64;
             g.note_bytes += note_len as u64;
-            worker.mark_name(shared, group, shared.name_id(hash_name(name, name_raw)));
+            shared.mark_name(group, shared.name_id(hash_name(name, name_raw)));
         }
     }
 }
@@ -386,8 +339,6 @@ fn main() {
         next_name: AtomicU32::new(0),
         seen: lazy_table((1 << (ID_BITS - 6)) * stride),
         stride,
-        inboxes: (0..threads).map(|_| Mutex::new(Vec::new())).collect(),
-        finished: AtomicUsize::new(0),
     };
 
     let first = input.iter().position(|&b| b == b'\n').map_or(input.len(), |i| i + 1);
@@ -400,17 +351,16 @@ fn main() {
     let mut totals = vec![EMPTY; count];
     thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
-            .map(|me| {
+            .map(|_| {
                 let (shared, cut, claim) = (&shared, &cut, &claim);
                 scope.spawn(move || {
-                    let mut worker = Worker::new(me, count);
+                    let mut groups = vec![EMPTY; count];
                     loop {
                         let i = claim.fetch_add(1, Relaxed);
                         if i >= SEGMENTS {
-                            worker.finish(shared);
-                            return worker.groups;
+                            return groups;
                         }
-                        parse_records(input, cut(i), cut(i + 1), shared, &mut worker);
+                        parse_records(input, cut(i), cut(i + 1), shared, &mut groups);
                     }
                 })
             })

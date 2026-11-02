@@ -375,22 +375,28 @@ struct Worker {
 
     // Evaluates one BOOL query on this chunk into `result`, strictly left to right.
     bool evaluate(const BoolOp* ops, size_t n, size_t words) {
-        std::fill_n(result.data(), words, 0);
+        // `result` is cleared only once some term can make it non-empty: most queries have no term
+        // in a given chunk, and they should cost almost nothing.
         bool any = false;
         for (size_t i = 0; i < n; i++) {
             const u32 t = ops[i].term;
+            if (!any && ops[i].op != OR) continue;
             const u16* docs = list.data() + (t ? counts[t] : 0);
             const size_t count = list.data() + counts[t + 1] - docs;
             const u32 at = dense_of[t];
             const u64* bits = at != NONE ? &dense[at * STRIDE] : nullptr;
             u64* r = result.data();
             if (ops[i].op == OR) {
+                if (!any) {
+                    if (!bits && !count) continue;
+                    std::fill_n(r, words, 0);
+                    any = true;
+                }
                 if (bits) {
                     for (size_t w = 0; w < words; w++) r[w] |= bits[w];
                 } else {
                     for (size_t d = 0; d < count; d++) set_bit(r, docs[d]);
                 }
-                any |= bits || count;
             } else if (ops[i].op == AND && any) {
                 if (bits) {
                     for (size_t w = 0; w < words; w++) r[w] &= bits[w];
