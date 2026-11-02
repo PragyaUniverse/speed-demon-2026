@@ -44,3 +44,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | a6841ff | 1.5 MB chunks | run-d8faeedac28a | 284 | 43.8 | Samples run-5ea383c1d8b0 291, run-4afa6c9d8533 294. Under the 44 MB point where memory stops earning, no time lost. K 22.9 to 23.3. **Kept** |
 | 0dadcf7 | gcc:16 instead of gcc:15 | run-9c578cde061b | 285 | 43.4 | Second sample run-33f0c6aca17e 286. K 23.2, steady. **Kept** |
 | 56ec956 | One-probe L1 table for frequent terms; absent terms skip a miss in evaluation | run-9b00fb226940 | 291 | 43.8 | Samples run-f5f140faf54c 291, run-ef08aa42fc8c 287. No gain for 24 lines, so L2 misses on common words are not the main cost. **Reverted** |
+| 485298f | x86-64-v3 instead of `-march=native` | run-d6848d174646 | 281 | 43.6 | Second sample run-f55b5004970b 285. The same within noise. **Kept native, which has the longer record** |

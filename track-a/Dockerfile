@@ -1,7 +1,7 @@
-FROM golang:1-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4 AS build
+FROM rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go build -o solution .
+RUN cargo build --release --offline
 FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-COPY --from=build /src/solution /app/solution
+COPY --from=build /src/target/release/solution /app/solution
 ENTRYPOINT ["/app/solution"]

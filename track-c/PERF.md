@@ -41,3 +41,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 3a81baf | Plain atomic name bits instead of owners and batches | run-30b836e83487 | 62.9 | 9.9 | Samples run-2429b2cfbd06 60.9, run-2c6e3a6cd7ed 61.8. 54 lines shorter but 50% slower: K about 25.7 against 31. Coherence traffic is the single most expensive thing measured on this machine, and it proves the owner scheme earns its lines. **Reverted** |
 | 0dadcf7 | `target-cpu=native` | run-ba21f8845b87 | 40.2 | 10.3 | Second sample run-4e716951e56f 46.6. No gain. **Reverted** |
 | 7a52b66 | Unmap each segment in its worker instead of all at exit | run-e3cf00d29f75 | 44.3 | 10.6 | Samples run-c14a8ad6be83 45.1, run-b165ee3a1f93 43.5. Slower than 41 to 42: the TLB shootdowns cost more than exit does. **Reverted** |
+| 485298f | C++ for x86-64-v3 | run-7e1439f162d1 | 49.6 | 10.3 | Second sample run-6667a5b3ddbc 50.0. K 29 against Rust's 31. **Rust kept** |
