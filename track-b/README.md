@@ -10,7 +10,7 @@
 
 Results are combined per query. Chunks are concatenated in order for the ten smallest ids. Memory is bounded by the chunk, not the corpus.
 
-**Build.** `pgo.profdata` is a profile from `tools/pgo.sh`, trained on public generator output at seed 2. It is about 5 to 10% on this track and nothing on the other three, so only this one uses it.
+**Language.** C++ with GCC. I built this design in both Rust and C++ and raced them on the board. They tied on speed, and C++ came out about 160 lines shorter, so it has a slightly higher K here; Rust won the other three tracks. The earlier Rust version is in the git history.
 
 **Dependencies.** None.
 
