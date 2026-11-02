@@ -113,42 +113,24 @@ impl Csr {
         Csr { offsets, edges }
     }
 
-    /// Inverts a CSR in place of bucketing: ids were just made local, so the shared counters a
-    /// worker touches are mostly on nearby lines, and no edge list is held twice in memory.
+    /// Inverts a CSR. Each block of head ids has one owning worker, the only one to touch its slots;
+    /// other workers send it (head, edge) pairs in batches. A shared atomic counter per node would be
+    /// about 10M locked instructions on lines bouncing between cores, the most expensive thing here.
     fn reversed(forward: &Csr) -> Csr {
         let n = forward.offsets.len() - 1;
         let mut offsets = vec![0u32; n + 1];
         let mut edges = vec![0u32; forward.edges.len()];
-        let counters = unsafe { slice::from_raw_parts(offsets.as_ptr() as *const AtomicU32, n + 1) };
-        let for_each_edge = |visit: &(dyn Fn(u32, u32) + Sync)| {
-            let claim = AtomicUsize::new(0);
-            thread::scope(|scope| {
-                for _ in 0..workers() {
-                    scope.spawn(|| loop {
-                        const STEP: usize = 1 << 12;
-                        let from = claim.fetch_add(STEP, Relaxed);
-                        if from >= n {
-                            return;
-                        }
-                        for u in from..(from + STEP).min(n) {
-                            forward.adjacent(u as u32).iter().for_each(|&e| visit(u as u32, e));
-                        }
-                    });
-                }
-            });
-        };
+        let (off, out) = (offsets.as_mut_ptr() as usize, edges.as_mut_ptr() as usize);
         // Same three states as in `build`: counts, then starts, then ends.
-        for_each_edge(&|_, e| {
-            counters[(e >> WEIGHT_BITS) as usize + 1].fetch_add(1, Relaxed);
-        });
+        exchange(forward, n, |head, _| unsafe { *(off as *mut u32).add(head as usize + 1) += 1 });
         let mut running = 0;
         for slot in offsets[1..].iter_mut() {
             (*slot, running) = (running, running + *slot);
         }
-        let out = edges.as_mut_ptr() as usize;
-        for_each_edge(&|u, e| unsafe {
-            let at = counters[(e >> WEIGHT_BITS) as usize + 1].fetch_add(1, Relaxed);
-            *(out as *mut u32).add(at as usize) = u << WEIGHT_BITS | (e & HEAVY);
+        exchange(forward, n, |head, edge| unsafe {
+            let cursor = (off as *mut u32).add(head as usize + 1);
+            *(out as *mut u32).add(*cursor as usize) = edge;
+            *cursor += 1;
         });
         Csr { offsets, edges }
     }
@@ -172,6 +154,56 @@ fn workers() -> usize {
 }
 
 const BLOB: usize = 512;
+
+/// Delivers every edge, reversed, to `apply` on the worker that owns its head.
+fn exchange(forward: &Csr, n: usize, apply: impl Fn(u32, u32) + Sync) {
+    const BATCH: usize = 128;
+    const STEP: usize = 1 << 12;
+    let threads = workers();
+    let inboxes: Vec<Mutex<Vec<(u32, u32)>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
+    let (claim, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    thread::scope(|scope| {
+        for me in 0..threads {
+            let (inboxes, claim, finished, apply) = (&inboxes, &claim, &finished, &apply);
+            scope.spawn(move || {
+                let mut outgoing = vec![Vec::with_capacity(BATCH); threads];
+                let mut spare: Vec<(u32, u32)> = Vec::new();
+                let drain = |spare: &mut Vec<(u32, u32)>| {
+                    std::mem::swap(&mut *inboxes[me].lock().unwrap(), spare);
+                    spare.iter().for_each(|&(head, edge)| apply(head, edge));
+                    spare.clear();
+                };
+                loop {
+                    let from = claim.fetch_add(STEP, Relaxed);
+                    if from >= n {
+                        break;
+                    }
+                    for u in from..(from + STEP).min(n) {
+                        for &e in forward.adjacent(u as u32) {
+                            let head = e >> WEIGHT_BITS;
+                            let owner = (head as usize >> 10) % threads;
+                            outgoing[owner].push((head, (u as u32) << WEIGHT_BITS | (e & HEAVY)));
+                            if outgoing[owner].len() == BATCH {
+                                inboxes[owner].lock().unwrap().extend_from_slice(&outgoing[owner]);
+                                outgoing[owner].clear();
+                                drain(&mut spare);
+                            }
+                        }
+                    }
+                }
+                for (owner, batch) in outgoing.iter().enumerate() {
+                    inboxes[owner].lock().unwrap().extend_from_slice(batch);
+                }
+                finished.fetch_add(1, AcqRel);
+                while finished.load(Acquire) < threads {
+                    drain(&mut spare);
+                    thread::yield_now();
+                }
+                drain(&mut spare);
+            });
+        }
+    });
+}
 
 /// Renumbers the nodes so that neighbours share cache lines: workers grow compact blobs by BFS from
 /// unclaimed seeds and each blob gets consecutive ids. A search wave then finds most of its next

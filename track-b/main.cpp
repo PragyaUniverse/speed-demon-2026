@@ -26,7 +26,7 @@ using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-constexpr size_t CHUNK_BYTES = 1 << 21, SAMPLE_BYTES = 1 << 18, READ_BYTES = 1 << 18, PAD = 128;
+constexpr size_t CHUNK_BYTES = 1 << 21, SAMPLE_BYTES = 1 << 18, READ_BYTES = 1 << 17, PAD = 128;
 constexpr u32 REL_BITS = 12;  // A 2 MB chunk holds about 2,000 documents; asserted to fit in 4,096.
 constexpr u32 NONE = ~0u, FREQUENT = 8;  // Terms this common in the sample write bitsets directly.
 constexpr size_t STRIDE = 1 << (REL_BITS - 6);  // Words per bitset row, enough for any chunk.
@@ -286,6 +286,9 @@ struct Worker {
     std::vector<u64> dense, result, scratch;
     std::vector<u8> emitted, buffer;
     std::vector<std::pair<u32, u32>> hits;
+    // Worst case per piece: untouched pages cost nothing.
+    u32* edges = (u32*)malloc((READ_BYTES + 64) * sizeof(u32));
+    u32* lfs = (u32*)malloc((READ_BYTES + 64) * sizeof(u32));
 
     Worker(const Queries& q, const Plan& plan)
         : last_doc(plan.bool_terms), counts(plan.bool_terms + 1), dense_of(plan.bool_terms, NONE), last_hit(q.phrases.size(), NONE), result(STRIDE), scratch(STRIDE), emitted(q.total), buffer(READ_BYTES + 2 * PAD) {
@@ -310,18 +313,49 @@ struct Worker {
             if (pread(fd, buffer.data() + PAD, wanted, position) != (ssize_t)wanted) abort();
             size_t whole = wanted;
             while (buffer[PAD + whole - 1] != '\n') whole--;
-            const u8* p = buffer.data() + PAD;
-            const u8* stop = p + whole;
-            while (p < stop) {
+            // Stage one: all token boundaries and LFs of this piece, from bitmasks, with no branch
+            // that depends on where a token ends. Starts and ends alternate.
+            const u8* origin = buffer.data() + PAD;
+            size_t edge_count = 0, lf_count = 0;
+            u64 carry = 0;
+            for (size_t at = 0; at < whole; at += 64) {
+                u64 token, lf;
+                classify(origin + at, token, lf);
+                if (whole - at < 64) {
+                    const u64 keep = (1ull << (whole - at)) - 1;
+                    token &= keep, lf &= keep;
+                }
+                u64 found = token ^ (token << 1 | carry);
+                carry = token >> 63;
+                const size_t n = __builtin_popcountll(found);
+                u32* out = edges + edge_count;
+                for (int i = 0; i < 24; i++) {  // Covers nearly every block in one fixed run.
+                    out[i] = at + __builtin_ctzll(found | 1ull << 63);
+                    found &= found - 1;
+                }
+                for (int i = 24; found; i++) {
+                    out[i] = at + __builtin_ctzll(found);
+                    found &= found - 1;
+                }
+                edge_count += n;
+                for (; lf; lf &= lf - 1) lfs[lf_count++] = at + __builtin_ctzll(lf);
+            }
+            // Stage two: a document is its id token, then every token before its LF.
+            size_t e = 0;
+            for (size_t l = 0; l < lf_count; l++) {
+                const u32 line_end = lfs[l];
                 u32 id = 0;
-                for (; *p != '\t'; p++) id = id * 10 + (*p - '0');
+                for (const u8* c = origin + edges[e], *x = origin + edges[e + 1]; c < x; c++) id = id * 10 + (*c - '0');
+                e += 2;
                 if (!docs) base = id;
                 docs++;
                 const u32 rel = id - base;
                 if (rel >> REL_BITS) abort();
-                p = for_each_token(p + 1, [&](const u8* a, const u8* b) {
-                    u32 term = q.terms.find(a, b - a);
-                    if (term == NONE) return;
+                for (; e < edge_count && edges[e] < line_end; e += 2) {
+                    const u8* a = origin + edges[e];
+                    const size_t token_len = edges[e + 1] - edges[e];
+                    u32 term = q.terms.find(a, token_len);
+                    if (term == NONE) continue;
                     u32 role = plan.role[term];
                     if (role & BOOL_TERM) {
                         u32 index = role & ~(BOOL_TERM | ANCHOR_TERM);
@@ -341,7 +375,7 @@ struct Worker {
                                 hits.push_back({ph.query, id});
                             }
                         }
-                });
+                }
             }
             position += whole;
         }

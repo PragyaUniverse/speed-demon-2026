@@ -361,8 +361,7 @@ fn main() {
     let data = env::var("SD_DATA").unwrap_or("/data".into());
     let out = env::var("SD_OUT").unwrap_or("/out".into());
     let file = File::open(format!("{data}/requests.log")).unwrap();
-    let path = format!("{out}/summary.txt");
-    let output = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).unwrap();
+    let output = File::create(format!("{out}/summary.txt")).unwrap();
     let len = file.metadata().unwrap().len() as usize;
     if len == 0 {
         return;
@@ -401,14 +400,6 @@ fn main() {
         (0..SLOTS).map(|s| (s, names.name(s))).filter(|e| !e.1.is_empty()).collect();
     order.sort_unstable_by_key(|e| e.1);
 
-    // Writing through a shared mapping faults the output pages in parallel, where write(2) would
-    // serialise on the inode lock. The file is sized for the worst case and cut to length at the end;
-    // only touched pages exist. A line is at most about 3x the input line it comes from.
-    let cap = 3 * len + 4096;
-    output.set_len(cap as u64).unwrap();
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&output);
-    let target = unsafe { mmap(ptr::null_mut(), cap, PROT_READ | PROT_WRITE, 1, fd, 0) } as usize;
-
     // offsets[h] is published once every earlier hour's length is known, which lets each worker
     // write its text at the right place while later hours are still being formatted.
     const UNKNOWN: u64 = u64::MAX;
@@ -433,13 +424,11 @@ fn main() {
                         std::hint::spin_loop();
                     };
                     offsets[bucket + 1].store(start + scratch.text.len() as u64, Release);
-                    let (from, count) = (scratch.text.as_ptr(), scratch.text.len());
-                    unsafe { ptr::copy_nonoverlapping(from, (target + start as usize) as *mut u8, count) };
+                    output.write_all_at(&scratch.text, start).unwrap();
                 }
             });
         }
     });
-    output.set_len(offsets[HOURS].load(Acquire)).unwrap();
     // Skip unmapping and destructors: the process is done and the clock is running.
     std::process::exit(0);
 }
