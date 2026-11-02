@@ -27,25 +27,9 @@ const SPILL: u32 = (1 << LAT_BITS) - 1;
 const DAYS: [&[u8; 11]; 4] = [b"2026-10-30T", b"2026-10-31T", b"2026-11-01T", b"2026-11-02T"];
 const PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 
-const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-const MAP_PRIVATE: i32 = 2;
-const MADV_DONTNEED: i32 = 4; // Drops the pages at once.
-#[cfg(target_os = "linux")]
-const MAP_ANON: i32 = 0x20;
-#[cfg(not(target_os = "linux"))]
-const MAP_ANON: i32 = 0x1000;
-
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     #[cfg(target_os = "linux")]
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-}
-
-/// Anonymous memory: only pages actually touched count toward the peak.
-fn reserve(bytes: usize) -> *mut u8 {
-    unsafe { mmap(ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) }
 }
 
 #[inline(always)]
@@ -81,14 +65,7 @@ unsafe fn until_space(p: *const u8) -> usize {
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn until_space(p: *const u8) -> usize {
-    let mut n = 0;
-    loop {
-        let k = first_byte(load(p.add(n)), b' ');
-        if k < 8 {
-            return n + k;
-        }
-        n += 8;
-    }
+    (0..).find(|&n| *p.add(n) == b' ').unwrap()
 }
 
 /// Lock-free endpoint interner shared by all workers. After the first few thousand lines it is
@@ -168,7 +145,7 @@ fn line_start(file: &File, len: usize, from: usize) -> usize {
 /// The records of one file segment. Each hour's words form a chain of BLOCK-aligned blocks.
 struct Segment {
     arena: *mut u32,
-    arena_bytes: usize,
+    arena_words: usize,
     next_block: usize, // Word index; block 0 is never used, so a cursor of 0 means "no block".
     cursor: [u32; HOURS], // Next free word of the hour's newest block.
     hours_left: AtomicU32,
@@ -193,9 +170,10 @@ impl Segment {
     /// Parses every line of the file range [start, end); both ends are line starts. The bytes are
     /// read into a buffer small enough to stay in this core's L2 while the lines are parsed.
     fn parse(&mut self, file: &File, start: usize, end: usize, names: &Interner, buffer: &mut [u8]) {
-        // Lines are at least 40 bytes and take at most 2 words: virtual space only, never touched.
-        self.arena_bytes = (end - start) / 4 + (HOURS + 2) * BLOCK * 8;
-        self.arena = reserve(self.arena_bytes) as *mut u32;
+        // Lines are at least 40 bytes and take at most 2 words of 4 bytes.
+        // A big allocation is mapped by malloc: untouched pages cost nothing, and freeing unmaps it.
+        self.arena_words = (end - start) / 16 + (HOURS + 2) * BLOCK * 2;
+        self.arena = Vec::<u32>::with_capacity(self.arena_words).leak().as_mut_ptr();
         self.next_block = BLOCK;
         let capacity = buffer.len() - PAD;
         let mut position = start;
@@ -270,7 +248,7 @@ impl Segment {
     /// Called after each hour is formatted; the last call gives the arena back.
     fn hour_done(&self, bucket: usize) {
         if self.cursor[bucket] != 0 && self.hours_left.fetch_sub(1, Relaxed) == 1 {
-            unsafe { madvise(self.arena as *mut u8, self.arena_bytes, MADV_DONTNEED) };
+            drop(unsafe { Vec::from_raw_parts(self.arena, 0, self.arena_words) });
         }
     }
 }
@@ -318,7 +296,7 @@ fn format_hour(bucket: usize, segments: &[Segment], order: &[(usize, &[u8])], s:
     s.latencies.resize(total as usize, 0);
     for segment in segments {
         segment.for_each(bucket, |slot, _, latency| {
-            s.latencies[next[slot] as usize] = latency;
+            unsafe { *s.latencies.get_unchecked_mut(next[slot] as usize) = latency };
             next[slot] += 1;
         });
     }
@@ -371,7 +349,7 @@ fn main() {
 
     let empty = || Segment {
         arena: ptr::null_mut(),
-        arena_bytes: 0,
+        arena_words: 0,
         next_block: 0,
         cursor: [0; HOURS],
         hours_left: AtomicU32::new(0),
