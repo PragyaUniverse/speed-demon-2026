@@ -42,3 +42,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 3a81baf | Clear the result only once a term can make it non-empty | run-73237f818982 | 283 | 48.7 | Samples run-021332888c64 294, run-5ef488b10fad 284. K about 22.8, for 6 lines. **Kept** |
 | ed87b79 | Two-stage tokeniser: all token boundaries first, then lookups | run-c8c252c5b5af | 293 | 48.7 | Samples run-e50fdf7ee5b8 309, run-648804c45b26 297. Correct but slower, as with Track C's parser, and 33 lines longer. **Reverted** |
 | a6841ff | 1.5 MB chunks | run-d8faeedac28a | 284 | 43.8 | Samples run-5ea383c1d8b0 291, run-4afa6c9d8533 294. Under the 44 MB point where memory stops earning, no time lost. K 22.9 to 23.3. **Kept** |
+| 0dadcf7 | gcc:16 instead of gcc:15 | run-9c578cde061b | 285 | 43.4 | Second sample run-33f0c6aca17e 286. K 23.2, steady. **Kept** |

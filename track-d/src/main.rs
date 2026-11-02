@@ -52,16 +52,7 @@ fn pack(node: u32, weight: u32) -> u32 {
 }
 
 /// Edges on their way into a CSR, bucketed by key node so that each partition builds on its own.
-type Buckets = Vec<Vec<Entry>>;
-
-/// The partition implies a node's high bits, so an edge in transit takes 6 bytes, not 8. These
-/// buckets set the peak memory of the whole run.
-#[derive(Clone, Copy)]
-#[repr(C, packed(2))]
-struct Entry {
-    low: u16,
-    edge: u32,
-}
+type Buckets = Vec<Vec<(u32, u32)>>;
 
 /// One direction of the graph.
 struct Csr {
@@ -98,8 +89,8 @@ impl Csr {
                         // is the start of the next, so offsets[x] finishes as the start of x.
                         let (first, last) = ((p << shift).min(n), ((p + 1) << shift).min(n));
                         for part in &parts {
-                            for e in &part[p] {
-                                *off.add(first + e.low as usize + 1) += 1;
+                            for &(node, _) in &part[p] {
+                                *off.add(node as usize + 1) += 1;
                             }
                         }
                         let mut running = starts[p] as u32;
@@ -109,9 +100,9 @@ impl Csr {
                             running += count;
                         }
                         for part in &parts {
-                            for e in &part[p] {
-                                let cursor = off.add(first + e.low as usize + 1);
-                                *out.add(*cursor as usize) = e.edge;
+                            for &(node, edge) in &part[p] {
+                                let cursor = off.add(node as usize + 1);
+                                *out.add(*cursor as usize) = edge;
                                 *cursor += 1;
                             }
                         }
@@ -336,8 +327,7 @@ impl Graph {
                                 if w >= HEAVY {
                                     local_heavy.push(((u as u64) << NODE_BITS | v as u64, w));
                                 }
-                                let entry = Entry { low: (u & ((1 << shift) - 1)) as u16, edge: pack(v, w) };
-                                buckets.get_unchecked_mut((u >> shift) as usize).push(entry);
+                                buckets.get_unchecked_mut((u >> shift) as usize).push((u, pack(v, w)));
                             }
                         }
                     })
