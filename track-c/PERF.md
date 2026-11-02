@@ -42,3 +42,4 @@ Each run ID below is one timed run on the scoring box. One run per push, so sing
 | 0dadcf7 | `target-cpu=native` | run-ba21f8845b87 | 40.2 | 10.3 | Second sample run-4e716951e56f 46.6. No gain. **Reverted** |
 | 7a52b66 | Unmap each segment in its worker instead of all at exit | run-e3cf00d29f75 | 44.3 | 10.6 | Samples run-c14a8ad6be83 45.1, run-b165ee3a1f93 43.5. Slower than 41 to 42: the TLB shootdowns cost more than exit does. **Reverted** |
 | 485298f | C++ for x86-64-v3 | run-7e1439f162d1 | 49.6 | 10.3 | Second sample run-6667a5b3ddbc 50.0. K 29 against Rust's 31. **Rust kept** |
+| 1faafee | Tables from calloc instead of a hand-declared mapping; shorter fallback; one send helper | run-1d4622e9bbc3 | 42.6 | 10.8 | Second sample run-cf77ce84bf1f 45.5. S 452 to 434, but about 0.6 MB more memory, K 29.2 to 30.3. **Calloc reverted, the rest kept** |

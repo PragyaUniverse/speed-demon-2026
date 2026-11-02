@@ -22,6 +22,7 @@ const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 
 const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 #[cfg(target_os = "linux")]
@@ -48,10 +49,12 @@ fn map_file(path: String) -> &'static [u8] {
     }
 }
 
-/// Zeroed atomics: a big zeroed allocation costs memory only where it is touched.
+/// Zeroed atomics that cost memory only where they are touched.
 fn lazy_table(n: usize) -> &'static [AtomicU64] {
-    let zeroed = vec![0u64; n].leak();
-    unsafe { slice::from_raw_parts(zeroed.as_ptr() as *const AtomicU64, n) }
+    unsafe {
+        let p = mmap(ptr::null_mut(), n * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        slice::from_raw_parts(p as *const AtomicU64, n)
+    }
 }
 
 #[inline(always)]
