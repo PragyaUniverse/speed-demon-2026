@@ -12,7 +12,7 @@ for t in a b c d; do
     echo "$r" | grep -q "full $want" || { echo "FAILED full $t"; exit 1; }
     echo "ok   $t cpp"
   else
-    python3.13 -I tools/verify.py "$t" --repeat 2 | tail -1 | cut -c1-70
+    python3.13 -I tools/verify.py "$t" --repeat 3 | tail -1 | cut -c1-70
   fi
 done
 git add -A .
