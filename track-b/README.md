@@ -1,6 +1,6 @@
 # Track B: Index
 
-**Approach.** The queries are known before the corpus is read, so there is no global index. The corpus is cut into 2 MB chunks of about 2,000 documents and read through 256 KB buffers, and a worker handles one chunk from start to finish:
+**Approach.** The queries are known before the corpus is read, so there is no global index. The corpus is cut into 1.5 MB chunks of about 1,500 documents and read through 256 KB buffers, and a worker handles one chunk from start to finish:
 
 1. Tokenise with AVX2: classify 64 bytes at a time into a token mask and walk its edges, so a token boundary costs a bit operation rather than a mispredicted per-byte branch. A token is looked up by a hash in a table of one u64 per slot, 1 MB in all so it stays in a core's L2, where a match means 63 hash bits agree (about 5e-9 chance of any false match in a run).
    Terms that are frequent in the sample skip that step: their bitset is written directly during the scan.
