@@ -30,7 +30,7 @@ constexpr size_t CHUNK_BYTES = 3 << 19, SAMPLE_BYTES = 1 << 18, READ_BYTES = 1 <
 constexpr u32 REL_BITS = 12;  // A 1.5 MB chunk holds about 1,500 documents; asserted to fit in 4,096.
 constexpr u32 NONE = ~0u, FREQUENT = 8;  // Terms this common in the sample write bitsets directly.
 constexpr size_t STRIDE = 1 << (REL_BITS - 6);  // Words per bitset row, enough for any chunk.
-constexpr u32 TERM_BITS = 18, TABLE_BITS = 17;
+constexpr u32 TERM_BITS = 18, TABLE_BITS = 17, FRONT_BITS = 11;
 constexpr u64 LOWER = 0x2020202020202020;
 constexpr u32 BOOL_TERM = 1u << 31, ANCHOR_TERM = 1u << 30;
 
@@ -127,8 +127,9 @@ struct Terms {
             if (slots[i] >> TERM_BITS == want) return (slots[i] & ((1u << TERM_BITS) - 1)) - 1;
         }
     }
-    INLINE u32 find(const u8* p, size_t len) const {
-        u64 h = token_hash(p, len), want = h << TERM_BITS >> TERM_BITS;
+    INLINE u32 find(const u8* p, size_t len) const { return find_hashed(token_hash(p, len)); }
+    INLINE u32 find_hashed(u64 h) const {
+        const u64 want = h << TERM_BITS >> TERM_BITS;
         for (size_t i = h >> (64 - TABLE_BITS);; i = (i + 1) & (slots.size() - 1)) {
             u64 slot = slots[i];
             if (slot >> TERM_BITS == want && slot) return (slot & ((1u << TERM_BITS) - 1)) - 1;
@@ -197,6 +198,9 @@ struct Plan {
     std::vector<u32> role;  // Per term: flags and its dense index among the BOOL terms.
     size_t bool_terms = 0, frequent = 0;  // BOOL terms below `frequent` use their index as bitset row.
     std::vector<u32> anchored_at, anchored;  // Per term: its range of phrases anchored on it.
+    // Frequent terms are most tokens, so they get a one-probe table that fits in L1 beside the big
+    // one: hash tag | row + 1. A term that loses its slot just takes the normal path.
+    std::vector<u64> front = std::vector<u64>(1 << FRONT_BITS);
 };
 
 static void make_plan(Queries& q, Plan& plan, const std::vector<u32>& frequency) {
@@ -224,6 +228,13 @@ static void make_plan(Queries& q, Plan& plan, const std::vector<u32>& frequency)
         plan.anchored_at[anchor + 1]++;
     }
     for (size_t i = 0; i < n; i++) plan.anchored_at[i + 1] += plan.anchored_at[i];
+    for (size_t t = 0; t < n; t++) {
+        const u32 role = plan.role[t], index = role & ~(BOOL_TERM | ANCHOR_TERM);
+        if (!(role & BOOL_TERM) || (role & ANCHOR_TERM) || index >= plan.frequent) continue;
+        const u64 h = token_hash(q.terms.text[t].p, q.terms.text[t].len);
+        u64& slot = plan.front[h >> (64 - FRONT_BITS)];
+        if (!slot) slot = h << TERM_BITS | (index + 1);
+    }
     plan.anchored.resize(q.phrases.size());
     std::vector<u32> cursor = plan.anchored_at;
     for (size_t i = 0; i < q.phrases.size(); i++) plan.anchored[cursor[q.phrase_terms[q.phrases[i].first + q.phrases[i].anchor_at]]++] = i;
@@ -286,6 +297,7 @@ struct Worker {
     std::vector<u64> dense, result, scratch;
     std::vector<u8> emitted, buffer;
     std::vector<std::pair<u32, u32>> hits;
+    size_t frequent_rows = 0;
 
     Worker(const Queries& q, const Plan& plan)
         : last_doc(plan.bool_terms), counts(plan.bool_terms + 1), dense_of(plan.bool_terms, NONE), last_hit(q.phrases.size(), NONE), result(STRIDE), scratch(STRIDE), emitted(q.total), buffer(READ_BYTES + 2 * PAD) {
@@ -320,7 +332,13 @@ struct Worker {
                 const u32 rel = id - base;
                 if (rel >> REL_BITS) abort();
                 p = for_each_token(p + 1, [&](const u8* a, const u8* b) {
-                    u32 term = q.terms.find(a, b - a);
+                    const u64 h = token_hash(a, b - a);
+                    const u64 front = plan.front[h >> (64 - FRONT_BITS)];
+                    if (front >> TERM_BITS == h << TERM_BITS >> TERM_BITS && front) {
+                        dense[((front & ((1u << TERM_BITS) - 1)) - 1) * STRIDE + (rel >> 6)] |= 1ull << (rel & 63);
+                        return;
+                    }
+                    u32 term = q.terms.find_hashed(h);
                     if (term == NONE) return;
                     u32 role = plan.role[term];
                     if (role & BOOL_TERM) {
@@ -350,6 +368,7 @@ struct Worker {
     // Groups the log by term: each term's documents become a u16 list, or a bitset if it has enough
     // of them that word-at-a-time operations win.
     void invert(size_t words, size_t frequent) {
+        frequent_rows = frequent;
         std::fill(counts.begin(), counts.end(), 0);
         for (u32 e : log) counts[(e >> REL_BITS) + 1]++;
         u32 total = 0;
@@ -383,7 +402,7 @@ struct Worker {
             if (!any && ops[i].op != OR) continue;
             const u16* docs = list.data() + (t ? counts[t] : 0);
             const size_t count = list.data() + counts[t + 1] - docs;
-            const u32 at = dense_of[t];
+            const u32 at = count || t < frequent_rows ? dense_of[t] : NONE;  // Absent terms skip a miss.
             const u64* bits = at != NONE ? &dense[at * STRIDE] : nullptr;
             u64* r = result.data();
             if (ops[i].op == OR) {
